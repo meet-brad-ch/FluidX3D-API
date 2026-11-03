@@ -82,12 +82,12 @@ TEST(BlowUpCheck, LimitsAndNonFinite) {
     const double infinity = std::numeric_limits<double>::infinity();
     const std::optional<std::string> calm = check.failure(100.0 * s, -3.0 * m / s, 5.0 * m / s);
     EXPECT_FALSE(calm.has_value());
-    const std::optional<std::string> at_limit = check.failure(100.0 * s, -40.0 * m / s, 40.0 * m / s);
+    const std::optional<std::string> at_limit = check.failure(100.0 * s, -30.0 * m / s, 30.0 * m / s);
     EXPECT_FALSE(at_limit.has_value());
-    const std::optional<std::string> over_up = check.failure(120.0 * s, -2.0 * m / s, 40.5 * m / s);
-    const std::string expected_message = "FAILED: the flow blew up at t 120 s (w -2.00..40.50 m/s)";
+    const std::optional<std::string> over_up = check.failure(120.0 * s, -2.0 * m / s, 30.5 * m / s);
+    const std::string expected_message = "FAILED: the flow blew up at t 120 s (w -2.00..30.50 m/s)";
     EXPECT_EQ(*over_up, expected_message);
-    const std::optional<std::string> over_down = check.failure(100.0 * s, -41.0 * m / s, 5.0 * m / s);
+    const std::optional<std::string> over_down = check.failure(100.0 * s, -31.0 * m / s, 5.0 * m / s);
     EXPECT_TRUE(over_down.has_value());
     const si::Speed not_a_number = nan * m / s;
     const std::optional<std::string> nan_up = check.failure(100.0 * s, -1.0 * m / s, not_a_number);

@@ -87,8 +87,10 @@ private:
 /// number when any cell's w is not finite.
 class BlowUpCheck {
 public:
-    /// The largest |w| of a healthy run by default (the CBL example's).
-    static constexpr si::Speed default_limit = (au::meters / au::second)(40.0);
+    /// The largest |w| of a healthy run by default (the CBL example's): a convective boundary layer stays below
+    /// 10 m/s; 30 m/s is well above that and below the lattice's own clamp, c_s dx/dt = 36.1 m/s at dx/dt = 62.5 m/s,
+    /// which a limit above the clamp could never catch.
+    static constexpr si::Speed default_limit = (au::meters / au::second)(30.0);
 
     /// @brief Makes the check.
     /// @param limit the largest |w| of a healthy run, more than 0
