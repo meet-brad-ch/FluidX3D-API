@@ -3,11 +3,11 @@
 FluidX3D-API adds thermal convection and moist air to FluidX3D. The target is the convective boundary layer (CBL) of
 the atmosphere: a heated ground, a capping inversion, a mean wind and cumulus clouds. This page tells you how to use
 the features and what their limits are. It also compares the results with the large-eddy simulation (LES) code MicroHH
-(van Heerwaarden et al. 2017). All numbers come from one RTX 4090. Earlier lattice Boltzmann solvers of the atmospheric
-boundary layer: ProLB (Feng et al. 2021: convective and stable layers, cities, the BOMEX cumulus case, the scalars in
-advective form by finite differences) and the stratified layers of Korb et al. 2026 (a temperature lattice; a hybrid
-finite-difference temperature was dropped for oscillations at the inversion). The scheme here differs in carrying the
-scalars in conservative form on the LBM's own link mass fluxes.
+(van Heerwaarden et al. 2017). All numbers come from one RTX 4090. Two earlier lattice Boltzmann solvers cover the
+atmospheric boundary layer. ProLB (Feng et al. 2021) runs convective and stable layers, cities and the BOMEX cumulus
+case, with the scalars in advective form by finite differences. Korb et al. 2026 run stratified layers with a
+temperature lattice. They dropped a hybrid finite-difference temperature because it oscillated at the inversion. The
+scheme here differs in carrying the scalars in conservative form on the LBM's own link mass fluxes.
 
 ## The features
 
@@ -38,8 +38,8 @@ the 18 D3Q19 links. The net mass comes from the post-collision populations (Dubo
     phi = (rho phi) / rho_FV
 
 - `phi_face,i` is the upwind MUSCL value along the link (kappa 1/3, the van Albada limiter in the form
-  `phi(r) = 2r / (1 + r^2)` on both slope terms, after ProLB: Feng et al. 2021). The diffusion is centred on the 6 axis
-  neighbours with face diffusivities, which include the eddy part.
+  `phi(r) = 2r / (1 + r^2)` on both slope terms, after ProLB: Feng et al. 2021). The diffusion uses the 6 axis
+  neighbours and face diffusivities, which include the eddy part.
 - A midpoint time step uses the fluxes of the step in both stages.
 - **Conservation:** `psi_ibar(x + c_i) = -psi_i(x)` exactly, so the sum of `rho phi` changes only by the sources.
 - **Uniformity:** a uniform phi stays uniform, because `rho phi` changes by phi times the change of `rho_FV`.
@@ -49,8 +49,9 @@ the 18 D3Q19 links. The net mass comes from the post-collision populations (Dubo
 
 **Domains.** A face value reads along each link the cell behind and the cell 2 ahead. So with `SCALAR_FV` the domain
 halo is 2 cells wide. After each finite-volume stage the domains exchange the stored scalars `T - 1` and `Q - 1`
-(2 layers), their half-step values (2 layers) and the diffusivity (1 layer); `rho_FV` and `rho phi` are not exchanged,
-because a cell reads them only at its own index. 2 x 1, 1 x 2 and 2 x 2 domains are bit-identical to one domain.
+(2 layers), their half-step values (2 layers) and the diffusivity (1 layer). The domains do not exchange `rho_FV` and
+`rho phi`, because a cell reads them only at its own index. 2 x 1, 1 x 2 and 2 x 2 domains are bit-identical to one
+domain.
 
 **Cost and memory** (a 10 m CBL with moisture, 256 x 256 x 207 = 13.57 M cells):
 
@@ -104,10 +105,10 @@ No runtime warning exists yet for `FP16S` with the D3Q7 `TEMPERATURE` lattice, o
 **Thermal convection** (with `THERMAL_DIFFUSIVITY_FIX`):
 
 - Rayleigh-Benard convection: the onset between Ra 1600 and 1900 (critical Ra 1708). Nu converges at first order with
-  the cell count (H 32, 64, 128 at Ra 1e5: 6.60, 5.58, 5.13; the observed order 1.19), and the Richardson
+  the cell count: at Ra 1e5, H 32, 64 and 128 give 6.60, 5.58 and 5.13, an observed order of 1.19. The Richardson
   extrapolation at that order gives 4.78 at Ra 1e5 and 8.72 at Ra 1e6. MicroHH in the same box gives 4.79 +- 0.37 and
-  8.67 +- 0.76; the fit Nu = 0.186 Ra^0.274 of Handler et al. 2023 to DNS and LES of air gives 4.36 and 8.18 (Kerr
-  1996 reports the exponent 0.28 for this range; an earlier version of this page credited the fit to Kerr).
+  8.67 +- 0.76. The fit Nu = 0.186 Ra^0.274 of Handler et al. 2023 to DNS and LES of air gives 4.36 and 8.18. Kerr
+  1996 reports the exponent 0.28 for this range. An earlier version of this page credited the fit to Kerr.
 - A plume from a heated patch stays laminar at this lattice's Reynolds numbers. Its width grows linearly.
 
 **The dry CBL** (Sullivan and Patton 2011, `sp2011`):
@@ -121,10 +122,10 @@ No runtime warning exists yet for `FP16S` with the D3Q7 `TEMPERATURE` lattice, o
 - `FP16S` DDFs with `SCALAR_FV` against FP32: w'^2 2.7 %, theta'^2 1.4 %, the heat flux 0.8 % (the FP32 seed spread:
   3.0, 3.8 and 1.1 %).
 
-**The budget:** the quantity the link-flux scheme conserves, `sum(rho_FV theta)` over the fluid cells, read from the
-device by `LBM::fv_inventory()`, matches the heat added within 0.004 % over 20 000 steps of the plume cases
-(`heat_conservation_fv`); the sum of `T - 1` that a user sees differs from it by up to 0.07 %, the departure of `rho_FV`
-from 1 where the scalar is not uniform.
+**The budget:** the link-flux scheme conserves `sum(rho_FV theta)` over the fluid cells. `LBM::fv_inventory()` reads it
+from the device. In the plume cases of `heat_conservation_fv` it matches the heat added within 0.004 % over 20 000
+steps. The sum of `T - 1` that a user sees differs from it by up to 0.07 %: `rho_FV` departs from 1 where the scalar is
+not uniform.
 
 **The moisture:** the added water's budget holds within 0.004 % with the D3Q7 lattice and 0.001 % with `SCALAR_FV`
 (`moisture_source`, `moisture_source_fv`), and theta_v after the saturation adjustment is within
@@ -138,10 +139,10 @@ of Bryan and Fritsch 2002 pass:
 wind stays within 6.6 % of MicroHH's nudged wind (tau 600 s).
 
 **The moist CBL** (`sounding ... --moist`, a heated patch, three seeds, the lid at 5000 m and at 4000 m for 5 m
-cells; the example's own `RESULT CLOUD` line and the paper's cloud statistics, `paper/data`):
+cells. The numbers are the example's own `RESULT CLOUD` line and the paper's cloud statistics):
 
 - The mean cloud base against the mixed layer's condensation level over the recorded intervals: 1.8 to 2.2 % at 10 m
-  cells and 1.5 to 2.8 % at 5 m on the normal sounding; 9.1 % on the humid sounding at 10 m.
+  cells and 1.5 to 2.8 % at 5 m on the normal sounding, and 9.1 % on the humid sounding at 10 m.
 - Against MicroHH on the same normal sounding (three seeds each), frame by frame over 30 minutes:
 
 | Mean over the frames | FluidX3D 10 m (3 seeds) | FluidX3D 5 m (3 seeds) | MicroHH (3 seeds) |
@@ -151,8 +152,8 @@ cells; the example's own `RESULT CLOUD` line and the paper's cloud statistics, `
 | All clouds, per km2 | 1.8 to 2.2 | 2.9 to 4.9 | 10.6 to 13.5 |
 | Cloud base / top (m) | 1901 to 1907 / 2523 to 2611 | 1896 to 1906 / 2416 to 2719 | 1832 to 1839 / 2606 to 2669 |
 
-The cover and the larger clouds agree. FluidX3D makes fewer clouds in all, 5 to 7 times fewer at 10 m and 2 to 5
-times at 5 m: it makes fewer small clouds (under 0.01 km2).
+The cover and the larger clouds agree. FluidX3D makes fewer clouds in total: 5 to 7 times fewer at 10 m and 2 to 5
+times fewer at 5 m. The missing clouds are the small ones, under 0.01 km2.
 
 ## Fixes in FluidX3D
 

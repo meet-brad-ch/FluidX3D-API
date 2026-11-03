@@ -54,9 +54,9 @@ the measurement that supports it. How to use the features, their limits and the 
   (320 x 320 x 375) take 48 % more time than one.
 - A 5 m CBL with `SCALAR_FV` and `FP16S` (480 x 480 x 748, 172 M cells) runs in two domains on one RTX 4090 at
   1660 MLUPs. 45 minutes of model time (33 750 steps) take 58 minutes.
-- The buoyancy force cap: with the absolute buoyancy `|fz| beta (T - 1)`, a tall stable layer drives a body force of
-  the order 1e-3 lattice units, at which the run went to NaN (a 10 m convective layer with the lid at 3 zi; at about
-  2.3 zi for this sounding). The lattice has no force clamp, only the velocity clamp at c_s. The reference-profile
+- The buoyancy force cap. With the absolute buoyancy `|fz| beta (T - 1)`, a tall stable layer drives a body force of
+  about 1e-3 lattice units. At that force the run went to NaN: a 10 m convective layer with the lid at 3 zi, and at
+  about 2.3 zi for this sounding. The lattice has no force clamp, only the velocity clamp at c_s. The reference-profile
   buoyancy removes the ramp and with it this cap.
 - A thermal layer that has only 3 to 4 cells carries 15 to 40 % too much heat (first-order wall treatment). For 5 %,
   a layer needs 6 to 7 cells.
