@@ -1174,6 +1174,26 @@ void LBM::run(const ulong steps, const ulong total_steps) { // initializes the L
 	if(get_D()>1u) for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue(); // wait for everything to finish (multi-GPU only)
 }
 
+#ifdef SCALAR_FV
+void LBM_Domain::read_fv_inventory(double& sum_rho_theta, double& sum_rho_fv) { // the conserved inventory from the device (this fork)
+	const ulong N = get_N();
+	Memory<float> rho_theta(device, N, 1u, true, true, 0.0f); // host copies of the device-only fields
+	Memory<float> rho_minus_1(device, N, 1u, true, true, 0.0f);
+	device.get_cl_queue().enqueueCopyBuffer(fvRT.get_cl_buffer(), rho_theta.get_cl_buffer(), 0ull, 0ull, N*sizeof(float));
+	device.get_cl_queue().enqueueCopyBuffer(fvR.get_cl_buffer(), rho_minus_1.get_cl_buffer(), 0ull, 0ull, N*sizeof(float));
+	rho_theta.read_from_device();
+	rho_minus_1.read_from_device();
+	flags.read_from_device();
+	sum_rho_theta = 0.0;
+	sum_rho_fv = 0.0;
+	for(ulong n=0ull; n<N; n++) {
+		if(flags[n]&TYPE_S) continue;
+		sum_rho_theta += (double)rho_theta[n];
+		sum_rho_fv += 1.0+(double)rho_minus_1[n];
+	}
+}
+#endif // SCALAR_FV
+
 void LBM::update_fields() { // update fields (rho, u, T) manually
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_update_fields();
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue();

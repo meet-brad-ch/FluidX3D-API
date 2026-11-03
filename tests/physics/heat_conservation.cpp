@@ -1,6 +1,7 @@
 // The heat budget with buoyancy (SCALAR_FV): a heated patch on the floor of a box with TYPE_S floor and ceiling (nu
 // 5e-4, alpha nu/0.71 with THERMAL_DIFFUSIVITY_FIX, SUBGRID with Pr_t 1/3, the Boussinesq force f = fz (1 - beta (T - 1))
-// with fz = -1e-6). Every 1000 steps of 20000: the total heat sum(T - 1) over the fluid cells against the heat added
+// with fz = -1e-6). Every 1000 steps of 20000: the total heat sum(T - 1) over the fluid cells and the weighted inventory
+// sum(rho_FV theta), the quantity the link-flux scheme conserves, read from the device, both against the heat added
 // (heat_rate x patch cells x steps), and the lowest T. The cases: without buoyancy (beta 0), the plume (beta 2000), the
 // plume without the eddy heat diffusivity, and the plume in a box periodic in z (no walls).
 // Passes when in every case the total heat stays within 2 % of the heat added and T never falls below 1 - 0.01
@@ -18,6 +19,8 @@ namespace {
 /// @brief The heat budget of one sample.
 struct HeatSample {
 	double total{ 0.0 };      ///< sum(T - 1) over the fluid cells
+	double weighted{ 0.0 };   ///< sum(rho_FV theta) over the fluid cells: the quantity the link-flux scheme conserves, read from the device
+	double rho_total{ 0.0 };  ///< sum(rho_FV) over the fluid cells
 	double minimum{ 0.0 };    ///< the smallest T of a fluid cell
 	double maximum{ 0.0 };    ///< the largest T of a fluid cell
 	double floor_mean{ 0.0 }; ///< the mean T of z = 1 outside the patch
@@ -34,9 +37,12 @@ struct CaseSettings {
 
 /// @brief What one case measured at the end.
 struct CaseResult {
-	double worst_budget{ 0.0 }; ///< the largest |total - added| / added over the samples
-	double lowest_T{ 0.0 };     ///< the smallest T of a fluid cell over the samples
-	double final_error{ 0.0 };  ///< (total - added) / added at the end
+	double worst_budget{ 0.0 };   ///< the largest |total - added| / added over the samples
+	double worst_weighted{ 0.0 }; ///< the same for the weighted inventory sum(rho_FV theta)
+	double lowest_T{ 0.0 };       ///< the smallest T of a fluid cell over the samples
+	double final_error{ 0.0 };    ///< (total - added) / added at the end
+	double final_weighted{ 0.0 }; ///< (sum(rho_FV theta) - added) / added at the end
+	double final_rho{ 0.0 };      ///< sum(rho_FV) over the fluid cells at the end, over the fluid cell count: the mean rho_FV
 	double floor_T{ 0.0 };      ///< the floor layer's mean T outside the patch at the end
 };
 
@@ -64,9 +70,15 @@ public:
 			const double added{ static_cast<double>(heat_rate) * static_cast<double>(patch) * static_cast<double>(t + sample) };
 			r.final_error = (s.total - added) / added;
 			r.worst_budget = std::fmax(r.worst_budget, std::fabs(r.final_error));
+			r.final_weighted = (s.weighted - added) / added;
+			r.worst_weighted = std::fmax(r.worst_weighted, std::fabs(r.final_weighted));
+			r.final_rho = s.rho_total / static_cast<double>(fluid_cells(lbm));
 			r.lowest_T = std::fmin(r.lowest_T, s.minimum);
 			r.floor_T = s.floor_mean;
 		}
+		const double final_weighted_percent{ percent * r.final_weighted };
+		std::printf("  weighted inventory sum(rho_FV theta) at the end: %+.4f %% of the heat added (worst %.4f %%); mean rho_FV %.6f\n",
+		            final_weighted_percent, percent * r.worst_weighted, r.final_rho);
 		const double final_percent{ percent * r.final_error };
 		const double worst_percent{ percent * r.worst_budget };
 		std::printf("  %s: budget error at the end %+.1f %% (worst %.1f %%), min T %.3f, floor T at the end %.3f\n", c.name, final_percent, worst_percent, r.lowest_T, r.floor_T);
@@ -115,6 +127,7 @@ private:
 		lbm.update_fields();
 		lbm.T.read_from_device();
 		HeatSample s{};
+		lbm.fv_inventory(s.weighted, s.rho_total);
 		s.minimum = start_extreme;
 		s.maximum = -start_extreme;
 		ulong floor_cells{ 0ull };
@@ -142,6 +155,21 @@ private:
 		}
 		s.floor_mean /= static_cast<double>(floor_cells);
 		return s;
+	}
+
+	/// @brief Counts the fluid cells of the box.
+	/// @param lbm the box's lattice, its flags read
+	/// @return the cells without TYPE_S
+	static ulong fluid_cells(LBM& lbm) {
+		ulong fluid{ 0ull };
+		const ulong cells = lbm.get_N();
+		for(ulong n{ 0ull }; n < cells; n++) {
+			const uchar solid_bit{ static_cast<uchar>(lbm.flags[n] & TYPE_S) };
+			if(solid_bit == 0u) {
+				fluid++;
+			}
+		}
+		return fluid;
 	}
 
 	static constexpr uint box_cells = 64u;         ///< the box's cells along x and y
@@ -178,6 +206,8 @@ void main_setup() { // extensions: VOLUME_FORCE TEMPERATURE THERMAL_DIFFUSIVITY_
 		char name[name_capacity]{};
 		std::snprintf(name, sizeof(name), "heat conservation, %s: total heat against the heat added", c.name);
 		PhysicsCheck::report(name, r.worst_budget, budget_limit);
+		std::snprintf(name, sizeof(name), "heat conservation, %s: the weighted inventory sum(rho_FV theta) against the heat added", c.name);
+		PhysicsCheck::report(name, r.worst_weighted, budget_limit);
 		std::snprintf(name, sizeof(name), "heat conservation, %s: no cooling below the start (1 - min T)", c.name);
 		const double cooling{ std::fmax(0.0, 1.0 - r.lowest_T) };
 		PhysicsCheck::report(name, cooling, cooling_limit);

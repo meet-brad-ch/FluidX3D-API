@@ -207,6 +207,11 @@ public:
 	ulong get_t() const { return t; } // get discrete time step in LBM units
 	uint get_velocity_set() const; // get LBM velocity set
 	void set_heat_rate(const float heat_rate) { this->heat_rate = heat_rate; } // set temperature added per time step to TYPE_Y fluid cells
+#ifdef SCALAR_FV
+	/// Reads the finite-volume inventory from the device: the sums of rho_FV theta (the quantity the link-flux scheme conserves)
+	/// and of rho_FV over the fluid cells of this domain, halo cells included (this fork; for the budget tests on one domain).
+	void read_fv_inventory(double& sum_rho_theta, double& sum_rho_fv);
+#endif // SCALAR_FV
 #ifdef LEVEL_FORCING
 	/// Writes the per-level terms (each vector holds Nz values): the force fx, fy per step, the damping rate r of w (a force -r rho w) and
 	/// the temperature T_ref that T relaxes toward at the rate r (a source r (T_ref - T) per step, TEMPERATURE only).
@@ -577,6 +582,14 @@ public:
 #endif // TEMPERATURE
 		for(uint d=0u; d<get_D(); d++) lbm_domain[d]->set_heat_rate(heat_rate);
 	}
+#ifdef SCALAR_FV
+	/// The finite-volume inventory of a one-domain lattice: the sums of rho_FV theta (the conserved quantity) and of rho_FV over
+	/// the fluid cells, read from the device (this fork; the budget tests).
+	void fv_inventory(double& sum_rho_theta, double& sum_rho_fv) {
+		if(get_D()!=1u) print_error("LBM::fv_inventory() reads one domain only.");
+		lbm_domain[0]->read_fv_inventory(sum_rho_theta, sum_rho_fv);
+	}
+#endif // SCALAR_FV
 	/// LEVEL_FORCING: the per-level terms for every domain (the domains must not be split along z: the level index is the local z).
 	void set_level_forcing(const std::vector<float>& fx, const std::vector<float>& fy, const std::vector<float>& rate, const std::vector<float>& T_ref) {
 #ifndef LEVEL_FORCING
