@@ -156,6 +156,9 @@ TEST(CblDescription, ValidateNamesEachFault) {
     const RunSchedule part_interval = RunSchedule{ .spinup = 65.0 * s, .record = 40.0 * s, .interval = 10.0 * s };
     const CblDescription not_whole_intervals = quick().with_schedule(part_interval);
     expect_fault(not_whole_intervals, "whole intervals");
+    const RunSchedule part_step = RunSchedule{ .spinup = 60.0 * s, .record = 40.0 * s, .interval = 0.1 * s }; // 2.5 steps of 0.04 s
+    const CblDescription not_whole_steps = quick().with_schedule(part_step);
+    expect_fault(not_whole_steps, "whole number of time steps");
     const RunSchedule coarse_schedule = RunSchedule{ .spinup = 60.0 * s, .record = 40.0 * s, .interval = 20.0 * s };
     const CblDescription coarse = quick().with_cell(20.0 * m);
     const CblDescription coarse_cells = coarse.with_schedule(coarse_schedule);

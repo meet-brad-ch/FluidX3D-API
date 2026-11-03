@@ -219,6 +219,14 @@ void CblDescription::validate_times() const {
     if(interval == 0u) {
         throw SetupError("CblDescription: the interval is shorter than half a time step");
     }
+    const si::Duration step{ time_step() };
+    const double interval_steps_exact{ au::as_raw_number(schedule_.interval / step) };
+    const double interval_steps_whole{ std::round(interval_steps_exact) };
+    const bool interval_whole{ std::fabs(interval_steps_exact - interval_steps_whole) <= 1.0e-6 * interval_steps_whole };
+    if(!interval_whole) {
+        throw SetupError("CblDescription: the interval must be a whole number of time steps (it is " + std::to_string(interval_steps_exact)
+                         + " steps: choose a cell size whose time step divides the interval)");
+    }
     const std::uint64_t spinup{ spinup_steps() };
     const std::uint64_t record{ record_steps() };
     const bool spinup_whole{ spinup % interval == 0u };
