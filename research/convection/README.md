@@ -104,11 +104,12 @@ No runtime warning exists yet for `FP16S` with the D3Q7 `TEMPERATURE` lattice, o
 
 **Thermal convection** (with `THERMAL_DIFFUSIVITY_FIX`):
 
-- Rayleigh-Benard convection: the onset between Ra 1600 and 1900 (critical Ra 1708). Nu converges at first order with
-  the cell count: at Ra 1e5, H 32, 64 and 128 give 6.60, 5.58 and 5.13, an observed order of 1.19. The Richardson
-  extrapolation at that order gives 4.78 at Ra 1e5 and 8.72 at Ra 1e6. MicroHH in the same box gives 4.79 +- 0.37 and
-  8.67 +- 0.76. The fit Nu = 0.186 Ra^0.274 of Handler et al. 2023 to DNS and LES of air gives 4.36 and 8.18. Kerr
-  1996 reports the exponent 0.28 for this range. An earlier version of this page credited the fit to Kerr.
+- Rayleigh-Benard convection: the onset between Ra 1600 and 1900 (critical Ra 1708). Nu converges with the cell count at an
+  observed order of 1.2 to 1.4. At Ra 1e5, H 32, 64 and 128 give 6.60, 5.58 and 5.13, an observed order of 1.19. The
+  Richardson extrapolation at that order gives 4.78. At Ra 1e6, H 64, 128 and 256 give 11.61, 9.99 and 9.36, an observed
+  order of 1.37. The extrapolation at that order gives 8.96. MicroHH in the same box gives 4.79 +- 0.37 at Ra 1e5 and
+  8.67 +- 0.76 at Ra 1e6. The fit Nu = 0.186 Ra^0.274 of Handler et al. 2023 to DNS and LES of air gives 4.36 and 8.19.
+  Kerr 1996 reports the exponent 0.28 for this range. An earlier version of this page credited the fit to Kerr.
 - A plume from a heated patch stays laminar at this lattice's Reynolds numbers. Its width grows linearly.
 
 **The dry CBL** (Sullivan and Patton 2011, `sp2011`):
