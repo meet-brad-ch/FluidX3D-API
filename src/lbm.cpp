@@ -1,5 +1,12 @@
 #include "lbm.hpp"
 
+#if defined(HEAT_MAP)&&!defined(TEMPERATURE)
+#error HEAT_MAP (a heat rate per TYPE_Y cell, this fork) needs TEMPERATURE.
+#endif // HEAT_MAP
+#if defined(HEAT_MAP)&&defined(SCALAR_FV)
+#error HEAT_MAP (this fork) heats the D3Q7 temperature lattice; SCALAR_FV carries T by finite volumes with the one heat_rate.
+#endif // HEAT_MAP
+
 
 
 Units units; // for unit conversion
@@ -233,6 +240,10 @@ void LBM_Domain::allocate(Device& device) {
 	kernel_fv_full.add_parameters(level);
 #endif // LEVEL_FORCING
 #endif // SCALAR_FV
+#ifdef HEAT_MAP
+	heat = Memory<float>(device, N, 1u, true, true, 0.0f); // the temperature each TYPE_Y cell gains per time step (this fork); last in stream_collide's arguments
+	kernel_stream_collide.add_parameters(heat);
+#endif // HEAT_MAP
 
 #ifdef PARTICLES
 	particles = Memory<float>(device, (ulong)particles_N, 3u);
@@ -619,6 +630,9 @@ string LBM_Domain::device_defines(const Device_Info& device_info) const { return
 #ifdef SCALAR_FV
 	"\n	#define SCALAR_FV" // T (and Q) by finite volumes (this fork)
 #endif // SCALAR_FV
+#ifdef HEAT_MAP
+	"\n	#define HEAT_MAP" // a heat rate per TYPE_Y cell (this fork)
+#endif // HEAT_MAP
 
 #ifdef PARTICLES
 	"\n	#define PARTICLES"
@@ -927,6 +941,11 @@ LBM::LBM(const uint Nx, const uint Ny, const uint Nz, const uint Dx, const uint 
 		for(uint d=0u; d<D; d++) buffers_Q[d] = &(lbm_domain[d]->Q);
 		Q = Memory_Container(this, buffers_Q, "Q");
 #endif // MOISTURE
+#ifdef HEAT_MAP
+		Memory<float>** buffers_heat = new Memory<float>*[D];
+		for(uint d=0u; d<D; d++) buffers_heat[d] = &(lbm_domain[d]->heat);
+		heat = Memory_Container(this, buffers_heat, "heat");
+#endif // HEAT_MAP
 	} {
 #ifdef PARTICLES
 		particles = &(lbm_domain[0]->particles);
@@ -1070,6 +1089,9 @@ void LBM::initialize() { // write all data fields to device and call kernel_init
 #ifdef MOISTURE
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->Q.enqueue_write_to_device(); // the start moisture field: the initialize kernel sets hi from it, as gi from T
 #endif // MOISTURE
+#ifdef HEAT_MAP
+	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->heat.enqueue_write_to_device(); // the heat map the host filled (this fork)
+#endif // HEAT_MAP
 #ifdef SCALAR_FV
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_fv_init(); // the shifted fields from the fields just written (SCALAR_FV)
 #endif // SCALAR_FV

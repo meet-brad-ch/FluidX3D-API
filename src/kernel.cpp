@@ -1540,6 +1540,9 @@ string opencl_c_container() { return R( // ########################## begin of O
 )+"#ifdef SCALAR_FV"+R(
 	, global float* fvD // the diffusivity of every cell for fv_scalars() (this fork)
 )+"#endif"+R( // SCALAR_FV
+)+"#ifdef HEAT_MAP"+R(
+	, const global float* heat // the temperature each TYPE_Y cell gains per time step, a map in place of the one heat_rate (this fork)
+)+"#endif"+R( // HEAT_MAP
 )+") {"+R( // stream_collide()
 	const uxx n = get_global_id(0); // n = x+(y+z*Ny)*Nx
 	if(n>=(uxx)def_N||is_halo(n)) return; // don't execute stream_collide() on halo
@@ -1756,7 +1759,11 @@ string opencl_c_container() { return R( // ########################## begin of O
 			}
 )+"#endif"+R( // MOISTURE
 			if(flagsn&TYPE_Y) { // heat source cell: add heat_rate to the temperature, spread over the DDFs like the equilibrium at rest (weights 1/4 and 1/8, D3Q7)
+)+"#ifdef HEAT_MAP"+R(
+				const float rate = heat[n]; // the cell's own rate from the heat map (this fork)
+)+"#else"+R( // HEAT_MAP
 				const float rate = (flagsn&TYPE_X) ? 4.0f*heat_rate : heat_rate; // TYPE_X|TYPE_Y: the heated patch, four times the floor's flux in the surface layer itself
+)+"#endif"+R( // HEAT_MAP
 				ghn[0] = fma(0.25f, rate, ghn[0]);
 				for(uint i=1u; i<7u; i++) ghn[i] = fma(0.125f, rate, ghn[i]);
 			}

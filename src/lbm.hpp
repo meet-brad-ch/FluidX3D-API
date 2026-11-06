@@ -138,6 +138,9 @@ public:
 #ifdef MOISTURE
 	Memory<float> Q; // total water of every cell as 1 + qt / def_q_scale (this fork)
 #endif // MOISTURE
+#ifdef HEAT_MAP
+	Memory<float> heat; // the temperature every TYPE_Y cell gains per time step, in place of heat_rate (this fork)
+#endif // HEAT_MAP
 #ifdef PARTICLES
 	Memory<float> particles; // particle positions
 #endif // PARTICLES
@@ -527,6 +530,9 @@ public:
 #ifdef MOISTURE
 	Memory_Container<float> Q; // total water of every cell as 1 + qt / def_q_scale (this fork)
 #endif // MOISTURE
+#ifdef HEAT_MAP
+	Memory_Container<float> heat; // the temperature every TYPE_Y cell gains per time step, in place of heat_rate (this fork)
+#endif // HEAT_MAP
 #ifdef PARTICLES
 	Memory<float>* particles; // particle positions
 #endif // PARTICLES

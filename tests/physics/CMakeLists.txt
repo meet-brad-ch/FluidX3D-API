@@ -37,6 +37,7 @@ fluidx3d_add_physics_test(sdf_domains)
 fluidx3d_add_physics_test(domains_flow EXTENSIONS FP16S EQUILIBRIUM_BOUNDARIES SUBGRID)
 # The convection extensions of this fork (research/convection/README.md). Each test runs in seconds to a few minutes.
 fluidx3d_add_physics_test(heat_source EXTENSIONS TEMPERATURE)
+fluidx3d_add_physics_test(heat_map EXTENSIONS TEMPERATURE HEAT_MAP)
 fluidx3d_add_physics_test(eddy_heat_diffusivity EXTENSIONS EQUILIBRIUM_BOUNDARIES TEMPERATURE SUBGRID)
 fluidx3d_add_physics_test(thermal_diffusivity EXTENSIONS TEMPERATURE)
 # The same test with THERMAL_DIFFUSIVITY_FIX: alpha is the diffusivity
