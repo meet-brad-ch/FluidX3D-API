@@ -47,6 +47,53 @@ inline uint fv_transfer_bytes() {
 enum enum_transfer_field { fi, rho_u_flags, flags, F, phi_massex_flags, gi, T, hi, fv, fv_half, fvD, flags_fv, enum_transfer_field_length };
 
 
+#ifdef VOLUMETRIC_WALL
+// Task 19 (2026-11-08): opt-in native LBM-path volumetric free-slip wall (the CF10 bounded operator with the CF13
+// facet state). Scope: one device, D3Q19 SRT, no SGS, FP32 shifted fi, FP64 boundary arithmetic. Task 43: the uniform
+// VOLUME_FORCE (LBM constructor fx, fy, fz; set_f) is allowed and acts in the R cells as in the ordinary cells; every
+// other forcing type stays rejected. Task 45: SUBGRID (the Smagorinsky closure of stream_collide) is allowed and is
+// applied in the R cells with the same formula in FP64 (vw_collide).
+// Task 98 (2026-11-10): VOLUMETRIC_WALL_RR27 (opt-in, off by default) is the qualified D3Q27 revision (task 90/94/96 reference,
+// research/wall_model/integration/task95/TASK95_ACCEPTED_FORMULATION_SPEC_E2_2026-11-10.md): RR collision with the full force
+// term Phi in EVERY cell in FP64, the wall-extrapolated even reference, the sampled friction, ONE mass correction per facet,
+// the feq3-Taylor centred scatter and the unchanged pending transport; FP32 shifted population storage. Without the macro the
+// D3Q19 path below is unchanged.
+#ifdef VOLUMETRIC_WALL_RR27
+#if !defined(D3Q27)||!defined(SRT)
+#error VOLUMETRIC_WALL_RR27 requires D3Q27 (SRT is only the carrier macro: the RR collision replaces its collision)
+#endif
+#if !defined(VOLUMETRIC_WALL_FP64_COLLISION)
+#error VOLUMETRIC_WALL_RR27 requires VOLUMETRIC_WALL_FP64_COLLISION (the ordinary cells collide in FP64)
+#endif
+#if defined(SUBGRID)||defined(VOLUMETRIC_WALL_SCATTER_INCREMENT)
+#error VOLUMETRIC_WALL_RR27 rejects SUBGRID (not qualified with the RR collision) and VOLUMETRIC_WALL_SCATTER_INCREMENT (an experimental variant outside the frozen model)
+#endif
+#else // VOLUMETRIC_WALL_RR27
+#if !defined(D3Q19)||!defined(SRT)
+#error VOLUMETRIC_WALL requires D3Q19 and SRT (task 19 initial scope; D3Q27 only with VOLUMETRIC_WALL_RR27)
+#endif
+#endif // VOLUMETRIC_WALL_RR27
+#if defined(FP16S)||defined(FP16C)
+#error VOLUMETRIC_WALL requires FP32 population storage (FP16 storage in the wall region is not established)
+#endif
+#if defined(FORCE_FIELD)||defined(LEVEL_FORCING)||defined(TEMPERATURE)||defined(MOISTURE)||defined(SCALAR_FV)||defined(SURFACE)||defined(PARTICLES)||defined(MOVING_BOUNDARIES)||defined(EQUILIBRIUM_BOUNDARIES)
+#error VOLUMETRIC_WALL rejects FORCE_FIELD, LEVEL_FORCING, TEMPERATURE/MOISTURE/SCALAR_FV, SURFACE, PARTICLES, MOVING/EQUILIBRIUM boundaries (only the uniform VOLUME_FORCE is supported as a driver, task 43)
+#endif
+#define TYPE_V TYPE_X // the cells of the wall region R (TYPE_X is free without MOISTURE)
+#include "experimental/volumetric_wall_native.hpp"
+#endif // VOLUMETRIC_WALL
+// Task 57 (2026-11-09): VOLUMETRIC_WALL_FP64_COLLISION (opt-in, off by default) collides the ORDINARY cells of a
+// VOLUMETRIC_WALL build with the FP64 formula of vw_collide (exact-in-double lattice weights, 53-bit density and
+// velocity); the population storage stays FP32. Reason: the float32 weight constants do not satisfy the lattice sum
+// identities (mass loss proportional to u^2) and rho * fl32(1/rho) is biased when rho is below 1 (excess momentum);
+// research/wall_model/audits/20261109_collision_e2. Without the macro stream_collide is unchanged.
+#if defined(VOLUMETRIC_WALL_FP64_COLLISION)&&!defined(VOLUMETRIC_WALL)
+#error VOLUMETRIC_WALL_FP64_COLLISION requires VOLUMETRIC_WALL (D3Q19, SRT, FP32 storage, an FP64-capable device)
+#endif
+#if defined(VOLUMETRIC_WALL_RR27)&&!defined(VOLUMETRIC_WALL)
+#error VOLUMETRIC_WALL_RR27 requires VOLUMETRIC_WALL
+#endif
+
 class LBM_Domain {
 private:
 	uint Nx=1u, Ny=1u, Nz=1u; // (local) lattice dimensions
@@ -66,6 +113,37 @@ private:
 	float particles_rho = 1.0f;
 
 	Device device; // OpenCL device associated with this LBM domain
+#ifdef VOLUMETRIC_WALL
+	// Task 19: the wall region R on the device. Rows, states and maps are restricted to R and re-indexed on the host
+	// (experimental/volumetric_wall_native.cpp); the native fi stays the only persistent population storage.
+	bool vw_enabled = false;
+	uint vw_rcells=0u, vw_facets=0u, vw_rows=0u, vw_owned=0u, vw_pending_slot=0u;
+	Memory<ulong> vw_cells, vw_addr0, vw_addr1; // lattice cell of every R cell; level-(t+1) address of every owned row at even/odd t
+	Memory<int> vw_c, vw_fx2lex, vw_lex2fx, vw_mindex; // lexicographic c table (57), the direction permutations, mesh cell of every lattice cell (-1 solid)
+	ulong vw_steps_completed = 0ull; // wall steps enqueued since attachment; the capture buffers are unavailable before the first
+	Memory<uint> vw_fo, vw_rd, vw_odir, vw_so, vw_si, vw_go, vw_gi, vw_doff, vw_di, vw_ro, vw_ri, vw_wo, vw_wi; // facet offsets, row directions, owned directions, CSR offsets/indices of S, G, D_owned, R_owned, W
+	Memory<uint> vw_clamp; // native clamp activation counter (allocated always; stream_collide increments it)
+	Memory<double> vw_sw, vw_gw, vw_dw, vw_rw, vw_ww, vw_vi, vw_normal, vw_area; // CSR weights, row prism volumes, facet normals and areas
+	Memory<double> vw_f, vw_post, vw_fields, vw_incoming, vw_Q, vw_impulse, vw_pending0, vw_pending1, vw_prestore, vw_f0; // step buffers, the two pending buffers, the supplied initial state of every mesh cell
+	Memory<float> vw_gpre; // the actual stored g of the R cells read at the start of the step
+	Memory<double> vw_phi; uint vw_use_phi=0u; // per-row friction vectors (3 per row) given to set_volumetric_wall (task 43; no environment variable); unused when 0
+	Kernel vw_kernel_load, vw_kernel_collide, vw_kernel_wall0, vw_kernel_wall1, vw_kernel_stream01, vw_kernel_stream10, vw_kernel_seed; // wall0/stream01 read pending0 and write pending1; wall1/stream10 the reverse
+	// Task 55: the affine transport candidate, used only when the container holds its six sections (vw_affine)
+	bool vw_affine = false;
+	uint vw_scount=0u, vw_gcount=0u; // support cells (ordinary cells in a gradient stencil), gradient cells
+	Memory<ulong> vw_scells; // lattice cell of every support cell (ascending mesh order)
+	Memory<uint> vw_goff, vw_gext, vw_gdon, vw_ocell; // gradient CSR offsets and extended stencil indices; gradient index of the donor of every G entry; R index of the receiver of every owned row
+	Memory<int> vw_dgrad, vw_ograd; // gradient index of the donor of every owned D entry (-1: no arm term); of the receiver of every owned row (-1: no scatter)
+	Memory<double> vw_gwt, vw_garm, vw_darm, vw_rarm, vw_rsw; // gradient weights; arms of G entries, of owned D entries, of owned R entries; h/V of owned R entries
+	Memory<double> vw_spost, vw_sfields, vw_grad, vw_ebar, vw_returned, vw_dinc; // support post and fields; 69 gradient values per gradient cell; prism mean of e per row; capture: R Q + centred scatter and the direct arm term per R state
+	Kernel vw_kernel_support, vw_kernel_gradient, vw_kernel_wall_affine0, vw_kernel_wall_affine1, vw_kernel_stream_affine01, vw_kernel_stream_affine10;
+#ifdef VOLUMETRIC_WALL_RR27
+	Memory<uint> vw_sgrad; // task 98: gradient index of the cell of every sampler (S) entry (the wall-extrapolated reference reads S[L rho], S[L u])
+	Memory<double> vw_wstate, vw_delta; // task 98: rho_w, u_w (4 per facet) and the one-per-facet mass correction delta, written by vw_wall_affine (capture)
+	Memory<uint> vw_wfail; // task 98: count of facets with a non-finite or non-positive rho_w (no clamp; any count invalidates the step)
+#endif // VOLUMETRIC_WALL_RR27
+	void set_volumetric_wall_affine(const fluidx3d::experimental::VolumetricWallNativeInput& input, const fluidx3d::experimental::VolumetricWallEmbedding& embedding); // after the common buffers exist
+#endif // VOLUMETRIC_WALL
 	Kernel kernel_initialize; // initialization kernel
 	Kernel kernel_stream_collide; // main LBM kernel
 	Kernel kernel_update_fields; // reads DDFs and updates (rho, u, T) in device memory
@@ -151,6 +229,25 @@ public:
 
 	LBM_Domain(const Device_Info& device_info, const uint Nx, const uint Ny, const uint Nz, const uint Dx, const uint Dy, const uint Dz, const int Ox, const int Oy, const int Oz, const float nu, const float fx, const float fy, const float fz, const float sigma, const float alpha, const float beta, const uint particles_N, const float particles_rho); // compiles OpenCL C code and allocates memory
 
+#ifdef VOLUMETRIC_WALL
+	/// @brief Upload the embedded wall (task 19). Requires an FP64-capable device; throws std::invalid_argument on a map that
+	/// references a cell outside R or a facet with more than 19 rows.
+	void set_volumetric_wall(const fluidx3d::experimental::VolumetricWallNativeInput& input, const fluidx3d::experimental::VolumetricWallEmbedding& embedding, const std::vector<double>& friction_rows); // friction_rows: rows*3 per-row friction vectors chosen by the caller (task 43), or empty = the original kernel friction expression (research only)
+	bool volumetric_wall_enabled() const { return vw_enabled; }
+	void enqueue_volumetric_wall_load(); // level-t states of the R cells into the FP64 scratch (before stream_collide)
+	void enqueue_volumetric_wall_step(); // collide, wall, stream + pending transfer (after stream_collide), then the pending swap
+	void enqueue_volumetric_wall_initial_state(); // the declared level-0 pre-collision state of every fluid cell into its t = 0 load addresses (after initialize): R cells from f0, ordinary cells from the native equilibrium
+	fluidx3d::experimental::VolumetricWallNativeCapture read_volumetric_wall_buffers(); // blocking reads of every R buffer, both pendings, the clamp count
+#ifdef VOLUMETRIC_WALL_RR27
+	void volumetric_wall_failure_counts(uint& wall_state_failures, uint& clamps); // #2034: the invalid-wall-state and clamp counters since the attachment (blocking, two values)
+#endif // VOLUMETRIC_WALL_RR27
+	void vw_read_fi(vector<fpxx>& host); // raw stored populations (the parity t gives their meaning)
+	void vw_write_fi(const vector<fpxx>& host);
+	void vw_read_pending(vector<double>& host); // the current pending inventory
+	void vw_write_pending(const vector<double>& host);
+	void set_time_step(const ulong steps) { t = steps; } // restart: the parity of a restored fi
+#endif // VOLUMETRIC_WALL
+	void read_fi_raw(vector<fpxx>& host); // blocking copy of the raw stored populations (slot*N + cell; their meaning needs the parity t); host only, every build (task 19 P1 instrument)
 	void enqueue_initialize(); // write all data fields to device and call kernel_initialize
 	void enqueue_stream_collide(); // call kernel_stream_collide to perform one LBM time step
 	void enqueue_update_fields(); // update fields (rho, u, T) manually
@@ -315,6 +412,9 @@ private:
 	void communicate_fi();
 	void communicate_rho_u_flags();
 	void communicate_flags();
+#ifdef VOLUMETRIC_WALL
+	void attach_volumetric_wall(const fluidx3d::experimental::VolumetricWallNativeInput& input, const std::vector<double>& friction_rows); // common part of set_volumetric_wall and set_volumetric_wall_research (task 43); throws
+#endif // VOLUMETRIC_WALL
 #ifdef FORCE_FIELD
 	void communicate_F();
 #endif // FORCE_FIELD
@@ -542,6 +642,7 @@ public:
 	~LBM();
 
 	void run(const ulong steps=max_ulong, const ulong total_steps=max_ulong); // initializes the LBM simulation (copies data to device and runs initialize kernel), then runs LBM
+	void read_fi_raw(vector<fpxx>& host) { if(get_D()!=1u) print_error("read_fi_raw(): one domain only"); lbm_domain[0]->read_fi_raw(host); } // raw stored populations of the single domain (task 19 P1 instrument; host only)
 	void update_fields(); // update fields (rho, u, T) manually
 	void reset(); // reset simulation (takes effect in following run() call)
 #ifdef FORCE_FIELD
@@ -557,6 +658,33 @@ public:
 	void integrate_particles(const ulong steps=max_ulong, const ulong total_steps=max_ulong, const uint time_step_multiplicator=1u); // intgegrate passive tracer particles forward in time in stationary flow field
 #endif // PARTICLES&&!FORCE_FIELD
 
+#ifdef VOLUMETRIC_WALL
+	/// @brief The supported attachment (task 43). Attach the native volumetric wall from a VWNAT01 container before run():
+	/// the host flags must already mark the solids (TYPE_S); the box must equal the lattice; R cells get TYPE_V. The
+	/// container MUST hold the section friction_rows (geometry-bound friction rows in its own row order; the supported
+	/// packer writes the accepted P2 construction). The rows are checked against the container's facets
+	/// (coefficient identities, VolumetricWallNativeInput::validate_friction_rows; necessary conditions, not a proof of
+	/// the construction) and no other source of coefficients exists on this path (no environment variable, no fallback).
+	/// @param vwnat_path path of the container
+	/// @note Fails closed with a named reason (print_error): unreadable container, a failed container identity, absent or
+	/// incompatible friction rows, box or viscosity mismatch, more than one domain, a call after run(), a second
+	/// attachment (replacing an attached wall is not implemented).
+	void set_volumetric_wall(const string& vwnat_path);
+	/// @brief The research attachment: reproduces the archived fixtures. It is NOT the supported path.
+	/// @param vwnat_path path of the container (a friction_rows section in it is ignored here)
+	/// @param rows_path "" = the original kernel friction expression (tasks 19-27, the "present" rows); otherwise a file of
+	/// exactly rows*3 little-endian doubles in the exported row order (the former VW_PHI file), checked only for length and
+	/// finite values, not against the geometry
+	/// @note Fails closed (print_error) on the same errors as set_volumetric_wall and on a wrong or non-finite rows file.
+	void set_volumetric_wall_research(const string& vwnat_path, const string& rows_path);
+	bool volumetric_wall_enabled() const { return lbm_domain[0]->volumetric_wall_enabled(); }
+	fluidx3d::experimental::VolumetricWallNativeCapture volumetric_wall_capture() { return lbm_domain[0]->read_volumetric_wall_buffers(); }
+	void volumetric_wall_read_fi(vector<fpxx>& host) { lbm_domain[0]->vw_read_fi(host); }
+	void volumetric_wall_write_fi(const vector<fpxx>& host) { lbm_domain[0]->vw_write_fi(host); }
+	void volumetric_wall_read_pending(vector<double>& host) { lbm_domain[0]->vw_read_pending(host); }
+	void volumetric_wall_write_pending(const vector<double>& host) { lbm_domain[0]->vw_write_pending(host); }
+	void volumetric_wall_set_time_step(const ulong t) { for(uint d=0u; d<get_D(); d++) lbm_domain[d]->set_time_step(t); } // restart: the parity of the restored fi
+#endif // VOLUMETRIC_WALL
 	uint get_Nx() const { return Nx; } // get (global) lattice dimensions in x-direction
 	uint get_Ny() const { return Ny; } // get (global) lattice dimensions in y-direction
 	uint get_Nz() const { return Nz; } // get (global) lattice dimensions in z-direction

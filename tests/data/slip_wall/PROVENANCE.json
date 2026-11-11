@@ -1,0 +1,27 @@
+{
+ "purpose": "Fixtures of the native volumetric wall unit tests (tests/unit/volumetric_wall_native_test.cpp). A missing file fails the tests.",
+ "source_branch": "volumetric-wall-model (research tree research/wall_model/integration)",
+ "files": {
+  "N16_decay_finite.vwnat": {
+   "sha256": "1400662a5a69306cdbc6c9a72a82995302d3bdcb1cfa6c333858a7f3e02c6ae8",
+   "source": "research/wall_model/integration/native_inputs/N16_decay_finite.vwnat",
+   "source_commit": "6bdc5f63",
+   "velocity_set": "D3Q19",
+   "made_by": "the registered task-19 exporter (export_native_input.py), the N16 duct of the accepted native wall"
+  },
+  "N16_decay_finite_p2.vwnat": {
+   "sha256": "7ac5b0c35792d66f2c72bf5c82b7b7664dc707e009cf64e7adc16745a27a98b9",
+   "source": "research/wall_model/integration/task43/inputs/N16_decay_finite_p2.vwnat",
+   "source_commit": "b31d5d50",
+   "velocity_set": "D3Q19",
+   "made_by": "task 43 vwnat_rows.py: the same container with the accepted P2 friction rows"
+  },
+  "M3_d3q27.vwnat": {
+   "sha256": "348f3ded246f11e03ebc5cab8b94b61a7db4378500bd3608b870e2e280a58bf0",
+   "source": "research/wall_model/integration/task95/development/M3_d3q27.vwnat",
+   "source_commit": "e9fb5fac",
+   "velocity_set": "D3Q27",
+   "made_by": "task 95 t95_geometry.py build on the task-26 M3 manifest (rest state, nu 0.1, omega 1.25, K 0); the M3 terrain of the task 96 and task 99 stage D qualification"
+  }
+ }
+}

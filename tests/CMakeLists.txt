@@ -85,3 +85,12 @@ fluidx3d_add_test(fluidx3d_sdf_cache_tests
     SOURCES unit/sdf_cache_test.cpp
     LINK fluidx3d::sdf_cache
 )
+
+# Task 19: fail-closed tests of the VWNAT01 container and the native embedding (GPU-free), with the experimental option.
+if(FLUIDX3D_EXPERIMENTAL_VOLUMETRIC_WALL)
+    fluidx3d_add_test(fluidx3d_volumetric_wall_native_tests SOURCES unit/volumetric_wall_native_test.cpp LINK fluidx3d_volumetric_wall_native)
+    set_target_properties(fluidx3d_volumetric_wall_native_tests PROPERTIES FLUIDX3D_PRECISE_FLOAT ON)
+    target_compile_definitions(fluidx3d_volumetric_wall_native_tests PRIVATE FLUIDX3D_VWNAT27_FIXTURE="${PROJECT_SOURCE_DIR}/tests/data/slip_wall/M3_d3q27.vwnat") # the D3Q27 M3 terrain (tests/data/slip_wall/PROVENANCE.json)
+    target_compile_definitions(fluidx3d_volumetric_wall_native_tests PRIVATE FLUIDX3D_VWNAT_FIXTURE="${PROJECT_SOURCE_DIR}/tests/data/slip_wall/N16_decay_finite.vwnat") # the registered N16 container of the research tree
+    target_compile_definitions(fluidx3d_volumetric_wall_native_tests PRIVATE FLUIDX3D_VWNAT_P2_FIXTURE="${PROJECT_SOURCE_DIR}/tests/data/slip_wall/N16_decay_finite_p2.vwnat") # task 43: the same container with the friction_rows section (vwnat_rows.py --build-p2)
+endif()

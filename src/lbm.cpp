@@ -150,6 +150,14 @@ void LBM_Domain::allocate(Device& device) {
 	kernel_initialize = Kernel(device, N, "initialize", fi, rho, u, flags);
 	kernel_stream_collide = Kernel(device, N, "stream_collide", fi, rho, u, flags, t, fx, fy, fz);
 	kernel_update_fields = Kernel(device, N, "update_fields", fi, rho, u, flags, t, fx, fy, fz);
+#ifdef VOLUMETRIC_WALL
+	vw_clamp = Memory<uint>(device, 1ull, 1u, true, true, 0u); // native clamp activations (task 19), zero at start
+	vw_clamp.write_to_device();
+	kernel_stream_collide.add_parameters(vw_clamp);
+#endif // VOLUMETRIC_WALL
+#ifdef VOLUMETRIC_WALL_FP64_COLLISION
+	kernel_stream_collide.add_parameters(1.0/(3.0*(double)nu+0.5)); // task 57: parameter 9, the FP64 relaxation rate of the ordinary cells; set_volumetric_wall replaces it by the container's omega
+#endif // VOLUMETRIC_WALL_FP64_COLLISION
 
 #ifdef FORCE_FIELD
 	F = Memory<float>(device, N, 3u);
@@ -607,6 +615,16 @@ string LBM_Domain::device_defines(const Device_Info& device_info) const { return
 #ifdef SUBGRID
 	"\n	#define SUBGRID"
 #endif // SUBGRID
+#ifdef VOLUMETRIC_WALL
+	"\n	#define VOLUMETRIC_WALL" // the native volumetric wall (task 19)
+	"\n	#define TYPE_V TYPE_X" // the cells of the wall region R
+#endif // VOLUMETRIC_WALL
+#ifdef VOLUMETRIC_WALL_FP64_COLLISION
+	"\n	#define VOLUMETRIC_WALL_FP64_COLLISION" // task 57: FP64 collision arithmetic in the ordinary cells, FP32 storage
+#endif // VOLUMETRIC_WALL_FP64_COLLISION
+#ifdef VOLUMETRIC_WALL_RR27
+	"\n	#define VOLUMETRIC_WALL_RR27" // task 98: the qualified D3Q27 RR revision of the wall
+#endif // VOLUMETRIC_WALL_RR27
 
 #ifdef LEVEL_FORCING
 	"\n	#define LEVEL_FORCING" // per-level forcing (this fork)
@@ -946,6 +964,9 @@ LBM::~LBM() {
 }
 
 void LBM::sanity_checks_constructor(const vector<Device_Info>& device_infos, const uint Nx, const uint Ny, const uint Nz, const uint Dx, const uint Dy, const uint Dz, const float nu, const float fx, const float fy, const float fz, const float sigma, const float alpha, const float beta, const uint particles_N, const float particles_rho) { // sanity checks on grid resolution and extension support
+#ifdef VOLUMETRIC_WALL
+	if(Dx*Dy*Dz!=1u) print_error("VOLUMETRIC_WALL requires one domain (task 19 initial scope)");
+#endif // VOLUMETRIC_WALL
 	if((ulong)Nx*(ulong)Ny*(ulong)Nz==0ull) print_error("Grid point number is 0: "+to_string(Nx)+"x"+to_string(Ny)+"x"+to_string(Nz)+" = 0.");
 	if(Dx*Dy*Dz==0u) print_error("You specified 0 LBM grid domains ("+to_string(Dx)+"x"+to_string(Dy)+"x"+to_string(Dz)+"). There has to be at least 1 domain in every direction. Check your input in LBM constructor.");
 	const uint local_Nx=Nx/Dx+2u*(Dx>1u), local_Ny=Ny/Dy+2u*(Dy>1u), local_Nz=Nz/Dz+2u*(Dz>1u);
@@ -1084,6 +1105,9 @@ void LBM::initialize() { // write all data fields to device and call kernel_init
 	communicate_phi_massex_flags();
 #endif // SURFACE
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_initialize(); // odd time step is baked-in the kernel
+#ifdef VOLUMETRIC_WALL
+	if(lbm_domain[0]->volumetric_wall_enabled()) lbm_domain[0]->enqueue_volumetric_wall_initial_state(); // declared level-0 pre-collision state into the t = 0 load sets of all fluid cells (R: supplied f0; ordinary: native equilibrium); initialize()'s post-collision-of-step-(-1) seeding is replaced, never silently kept
+#endif // VOLUMETRIC_WALL
 	communicate_rho_u_flags();
 #ifdef SURFACE
 	communicate_phi_massex_flags();
@@ -1111,7 +1135,13 @@ void LBM::do_time_step() { // call kernel_stream_collide to perform one LBM time
 #ifdef SURFACE
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_surface_0();
 #endif // SURFACE
+#ifdef VOLUMETRIC_WALL
+	if(lbm_domain[0]->volumetric_wall_enabled()) lbm_domain[0]->enqueue_volumetric_wall_load(); // level-t states of R (reads only R address sets), before the ordinary kernel
+#endif // VOLUMETRIC_WALL
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_stream_collide(); // run LBM stream_collide kernel after domain communication
+#ifdef VOLUMETRIC_WALL
+	if(lbm_domain[0]->volumetric_wall_enabled()) lbm_domain[0]->enqueue_volumetric_wall_step(); // collide, wall (all Q), then stream + pending on the in-order queue
+#endif // VOLUMETRIC_WALL
 #if defined(SURFACE) || defined(GRAPHICS)
 	communicate_rho_u_flags(); // rho/u/flags halo data is required for SURFACE extension, and u halo data is required for Q-criterion rendering
 #endif // SURFACE || GRAPHICS
@@ -1152,8 +1182,17 @@ void LBM::do_time_step() { // call kernel_stream_collide to perform one LBM time
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->increment_time_step();
 }
 
+void LBM_Domain::read_fi_raw(vector<fpxx>& host) { // blocking raw copy of fi (every build; no kernel involved)
+	host.resize(fi.range());
+	device.finish_queue();
+	device.get_cl_queue().enqueueReadBuffer(fi.get_cl_buffer(), CL_TRUE, 0ull, fi.capacity(), (void*)host.data());
+}
+
 void LBM::run(const ulong steps, const ulong total_steps) { // initializes the LBM simulation (copies data to device and runs initialize kernel), then runs LBM
 	info.append(steps, total_steps, get_t()); // total_steps parameter is just for runtime estimation
+#ifdef VOLUMETRIC_WALL_RR27
+	if(!lbm_domain[0]->volumetric_wall_enabled()) print_error("VOLUMETRIC_WALL_RR27: run() without an attached wall is refused (the RR collision of this build differs from the baseline; attach with set_volumetric_wall() before run(), or use a build without the macro)"); // task 98 (#1991)
+#endif // VOLUMETRIC_WALL_RR27
 	if(!initialized) {
 		initialize();
 		info.print_initialize(this); // only print setup info if the setup is new (run() was not called before)
@@ -1172,6 +1211,13 @@ void LBM::run(const ulong steps, const ulong total_steps) { // initializes the L
 		info.update(clock.stop());
 	}
 	if(get_D()>1u) for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue(); // wait for everything to finish (multi-GPU only)
+#ifdef VOLUMETRIC_WALL_RR27
+	{ // #2034: the run is invalid when any facet had a non-positive or non-finite wall density, or a velocity reached the clamp limit, since the attachment. Detected HERE, at the end of run() (one read of two counters), not at the failing step; the state is not clamped or repaired.
+		uint wall_state_failures = 0u, clamps = 0u;
+		lbm_domain[0]->volumetric_wall_failure_counts(wall_state_failures, clamps);
+		if(wall_state_failures>0u||clamps>0u) print_error("VOLUMETRIC_WALL_RR27: invalid run: "+to_string(wall_state_failures)+" invalid wall states (rho_w <= 0 or not finite) and "+to_string(clamps)+" velocity clamps since the attachment (detected at the end of run(), t = "+to_string(get_t())+")");
+	}
+#endif // VOLUMETRIC_WALL_RR27
 }
 
 #ifdef SCALAR_FV
@@ -1734,3 +1780,358 @@ void LBM::communicate_particles() {
 	}
 }
 #endif // PARTICLES
+
+#ifdef VOLUMETRIC_WALL
+// ---------------------------------------------------------------- Task 19: native volumetric wall, host side
+#include <stdexcept>
+#include <algorithm>
+#include <map>
+#include <fstream>
+#include <cstdlib>
+#include <cmath>
+namespace {
+template<class T> void vw_upload(Device& device, Memory<T>& memory, const std::vector<T>& values) { // host vector -> new device buffer (at least one element)
+	const ulong count = (ulong)std::max((size_t)1u, values.size());
+	memory = Memory<T>(device, count);
+	for(size_t i=0u; i<values.size(); i++) memory[(ulong)i] = values[i];
+	memory.write_to_device();
+}
+template<class T> std::vector<T> vw_download(Memory<T>& memory) { // blocking device -> host copy, values unchecked (evidence)
+	memory.read_from_device();
+	std::vector<T> values((size_t)memory.range());
+	for(ulong i=0ull; i<memory.range(); i++) values[(size_t)i] = memory[i];
+	return values;
+}
+}
+void LBM_Domain::set_volumetric_wall(const fluidx3d::experimental::VolumetricWallNativeInput& input, const fluidx3d::experimental::VolumetricWallEmbedding& embedding, const std::vector<double>& friction_rows) {
+	using namespace fluidx3d::experimental;
+	if(device.info.is_fp64_capable==0u) throw std::runtime_error("VOLUMETRIC_WALL needs an FP64-capable device (cl_khr_fp64)");
+	if(!std::isfinite(input.friction)||input.friction<0.0) throw std::invalid_argument("VOLUMETRIC_WALL friction K must be finite and >= 0 (task 21: nonzero K is the registered finite-friction scope; the kernel term -K vi q_i odd_i is executed as written)");
+	if((float)input.viscosity!=nu) throw std::invalid_argument("container viscosity "+to_string(input.viscosity)+" differs from the LBM nu "+to_string(nu)+" under the FP32 conversion (#273)"); // declared FP32 equivalence, no tolerance
+	// Task 45 (#1015): the former check float32(container omega) == 1.0f/get_tau() is removed. It compared two
+	// roundings of the same declared viscosity: the container's omega = 1/(3 nu + 1/2) in FP64 cast to float, and the
+	// engine's float expression. They need not be the same float (they differ by one unit at nu = 1e-5), so the check
+	// refused valid input. What binds the two rates is kept: float32(container viscosity) == the LBM nu exactly (above),
+	// and the container's own omega = 1/(3 nu + 1/2) within 1e-12 (VolumetricWallNativeInput::validate). The ordinary
+	// cells then relax with 1.0f/get_tau() and the wall cells with the container's FP64 omega, as before; no rate is changed.
+	if(!(input.omega>0.0&&input.omega<2.0)) throw std::invalid_argument("container omega "+to_string(input.omega)+" is not inside (0, 2)");
+	const uint q = input.velocity_set; // task 98: the container's velocity set must be the build's
+	if(q!=velocity_set) throw std::invalid_argument("the container is D3Q"+to_string(q)+", the build is D3Q"+to_string(velocity_set));
+#ifdef VOLUMETRIC_WALL_RR27
+	if(!input.affine()) throw std::invalid_argument("VOLUMETRIC_WALL_RR27 needs the affine container sections (arms, gradient map) and the friction rows (task 98)");
+#endif // VOLUMETRIC_WALL_RR27
+	const std::vector<std::int64_t>& rcells = embedding.r_cells();
+	const std::vector<std::int64_t>& rindex = embedding.r_index_of_cell();
+	const NativeDirections& dir = embedding.directions();
+	vw_rcells = (uint)rcells.size(); vw_facets = input.facets; vw_rows = input.rows; vw_owned = (uint)embedding.owned().size();
+	const auto remap_cell = [&](const uint cell) { const std::int64_t r = rindex[cell]; if(r<0) throw std::invalid_argument("a map references a cell outside R"); return (uint)r; };
+	std::vector<ulong> cells(vw_rcells);
+	for(uint r=0u; r<vw_rcells; r++) cells[r] = (ulong)embedding.lattice_of_cell()[(size_t)rcells[r]];
+	std::vector<int> mindex_of_lattice((size_t)get_N(), -1); // explicit-state contract (#273): every fluid cell has a container state
+	for(uint cell=0u; cell<input.cells; cell++) mindex_of_lattice[(size_t)embedding.lattice_of_cell()[cell]] = (int)cell;
+	for(ulong n=0ull; n<get_N(); n++) if(!(flags[n]&TYPE_S) && mindex_of_lattice[(size_t)n]<0) throw std::invalid_argument("fluid cell "+to_string(n)+" has no state in the container: the attachment seeds every fluid cell from f0 and refuses to substitute an equilibrium");
+	std::vector<int> c(3u*q), fx2lex(q), lex2fx(q);
+	for(uint d=0u; d<q; d++) { for(uint a=0u; a<3u; a++) c[3u*d+a] = dir.lex_c(d, a); lex2fx[d] = (int)dir.lex_to_fx(d); fx2lex[d] = (int)dir.fx_to_lex(d); }
+	std::vector<uint> si(input.S.indices.size()), gi(input.G.indices.size());
+	for(size_t z=0u; z<si.size(); z++) si[z] = remap_cell(input.S.indices[z]);
+	for(size_t z=0u; z<gi.size(); z++) gi[z] = remap_cell(input.G.indices[z]/q)*q+input.G.indices[z]%q;
+	std::vector<uint> doff(vw_owned+1u, 0u), ro(vw_owned+1u, 0u), di, ri, odir(vw_owned);
+	std::vector<double> dw, rw;
+	std::vector<ulong> addr0(vw_owned), addr1(vw_owned);
+	for(uint o=0u; o<vw_owned; o++) {
+		const NativeOwnedRow& row = embedding.owned()[o];
+		const uint state = row.receiver_cell*q+row.direction;
+		odir[o] = row.direction; addr0[o] = (ulong)row.address_parity0; addr1[o] = (ulong)row.address_parity1;
+		for(uint z=input.D.offsets[state]; z<input.D.offsets[state+1u]; z++) { di.push_back(remap_cell(input.D.indices[z]/q)*q+input.D.indices[z]%q); dw.push_back(input.D.weights[z]); }
+		doff[o+1u] = (uint)di.size();
+		for(uint z=input.R.offsets[state]; z<input.R.offsets[state+1u]; z++) { ri.push_back(input.R.indices[z]); rw.push_back(input.R.weights[z]); }
+		ro[o+1u] = (uint)ri.size();
+	}
+	std::vector<double> f0(input.f0.begin(), input.f0.end()); // the supplied level-0 state of every mesh cell (lexicographic, cell-major)
+	for(uint cell=0u; cell<input.cells; cell++) { // the field cache of every mesh cell from its f0 moments (level 0, pre-collision)
+		double rho_c=0.0, jx=0.0, jy=0.0, jz=0.0;
+		for(uint d=0u; d<q; d++) { const double v = input.f0[cell*q+d]; rho_c += v; jx += v*dir.lex_c(d, 0); jy += v*dir.lex_c(d, 1); jz += v*dir.lex_c(d, 2); }
+		const ulong n = (ulong)embedding.lattice_of_cell()[cell];
+		rho[n] = (float)rho_c; u.x[n] = (float)(jx/rho_c); u.y[n] = (float)(jy/rho_c); u.z[n] = (float)(jz/rho_c);
+	}
+	vw_upload(device, vw_cells, cells); vw_upload(device, vw_addr0, addr0); vw_upload(device, vw_addr1, addr1);
+	vw_upload(device, vw_c, c); vw_upload(device, vw_fx2lex, fx2lex); vw_upload(device, vw_lex2fx, lex2fx); vw_upload(device, vw_mindex, mindex_of_lattice);
+	vw_upload(device, vw_fo, input.facet_offsets); vw_upload(device, vw_rd, input.row_direction); vw_upload(device, vw_odir, odir);
+	vw_upload(device, vw_so, input.S.offsets); vw_upload(device, vw_si, si); vw_upload(device, vw_sw, input.S.weights);
+	vw_upload(device, vw_go, input.G.offsets); vw_upload(device, vw_gi, gi); vw_upload(device, vw_gw, input.G.weights);
+	vw_upload(device, vw_doff, doff); vw_upload(device, vw_di, di); vw_upload(device, vw_dw, dw);
+	vw_upload(device, vw_ro, ro); vw_upload(device, vw_ri, ri); vw_upload(device, vw_rw, rw);
+	vw_upload(device, vw_wo, input.W.offsets); vw_upload(device, vw_wi, input.W.indices); vw_upload(device, vw_ww, input.W.weights);
+	vw_upload(device, vw_vi, input.prism_volume); vw_upload(device, vw_normal, input.normal); vw_upload(device, vw_area, input.area);
+	vw_upload(device, vw_f0, f0);
+	{ // task 43: the per-row friction vectors are an explicit argument (rows*3 doubles, exported row order); empty = the original kernel friction expression (research path only). No environment variable is read.
+		const size_t phi_size = (size_t)input.rows*3u;
+		if(!friction_rows.empty() && friction_rows.size()!=phi_size) throw std::invalid_argument("friction rows: the size is not rows*3");
+		for(const double v : friction_rows) if(!std::isfinite(v)) throw std::invalid_argument("friction rows: non-finite value");
+		vw_use_phi = friction_rows.empty() ? 0u : 1u;
+		const std::vector<double> zero_rows(friction_rows.empty() ? phi_size : (size_t)0u, 0.0); // the buffer of the unused branch
+		vw_upload(device, vw_phi, friction_rows.empty() ? zero_rows : friction_rows);
+	}
+	vw_upload(device, vw_pending0, input.s0);
+	vw_upload(device, vw_pending1, std::vector<double>(input.rows, 0.0));
+	vw_f = Memory<double>(device, (ulong)q*vw_rcells); vw_post = Memory<double>(device, (ulong)q*vw_rcells); vw_fields = Memory<double>(device, 4ull*vw_rcells);
+	vw_gpre = Memory<float>(device, (ulong)q*vw_rcells);
+	vw_incoming = Memory<double>(device, (ulong)vw_rows); vw_Q = Memory<double>(device, (ulong)vw_rows); vw_impulse = Memory<double>(device, 3ull*vw_facets);
+	vw_prestore = Memory<double>(device, (ulong)std::max(1u, vw_owned));
+	vw_pending_slot = 0u;
+	vw_kernel_load = Kernel(device, (ulong)vw_rcells, "vw_load", vw_rcells, vw_cells, vw_fx2lex, vw_c, fi, t, vw_f, vw_gpre);
+	vw_kernel_collide = Kernel(device, (ulong)vw_rcells, "vw_collide", vw_rcells, input.omega, vw_c, vw_f, vw_post, vw_fields, vw_cells, rho, u);
+#ifdef VOLUME_FORCE
+	vw_kernel_collide.add_parameters(fx, fy, fz); // task 43: parameters 9, 10, 11; rewritten with the current force at every dispatch (enqueue_volumetric_wall_step)
+#endif // VOLUME_FORCE
+	vw_kernel_wall0 = Kernel(device, (ulong)vw_facets, "vw_wall", vw_facets, input.friction, vw_c, vw_fo, vw_rd, vw_vi, vw_normal, vw_area, vw_so, vw_si, vw_sw, vw_go, vw_gi, vw_gw, vw_post, vw_fields, vw_pending0, vw_incoming, vw_Q, vw_impulse, vw_use_phi, vw_phi);
+	vw_kernel_wall1 = Kernel(device, (ulong)vw_facets, "vw_wall", vw_facets, input.friction, vw_c, vw_fo, vw_rd, vw_vi, vw_normal, vw_area, vw_so, vw_si, vw_sw, vw_go, vw_gi, vw_gw, vw_post, vw_fields, vw_pending1, vw_incoming, vw_Q, vw_impulse, vw_use_phi, vw_phi);
+	const ulong stream_range = (ulong)vw_owned+(ulong)vw_rows;
+	vw_kernel_stream01 = Kernel(device, stream_range, "vw_stream_pending", vw_owned, vw_rows, vw_c, vw_odir, vw_addr0, vw_addr1, t, vw_doff, vw_di, vw_dw, vw_ro, vw_ri, vw_rw, vw_post, vw_Q, vw_wo, vw_wi, vw_ww, vw_vi, vw_pending1, fi, vw_prestore);
+	vw_kernel_stream10 = Kernel(device, stream_range, "vw_stream_pending", vw_owned, vw_rows, vw_c, vw_odir, vw_addr0, vw_addr1, t, vw_doff, vw_di, vw_dw, vw_ro, vw_ri, vw_rw, vw_post, vw_Q, vw_wo, vw_wi, vw_ww, vw_vi, vw_pending0, fi, vw_prestore);
+	vw_kernel_seed = Kernel(device, get_N(), "vw_seed_initial", flags, vw_mindex, vw_lex2fx, vw_c, vw_f0, fi);
+#ifdef VOLUMETRIC_WALL_FP64_COLLISION
+	kernel_stream_collide.set_parameters(9u, input.omega); // task 57: the ordinary cells relax with the same double omega as vw_collide
+	print_info("volumetric wall: FP64 collision of the ordinary cells (task 57), omega from the container");
+#endif // VOLUMETRIC_WALL_FP64_COLLISION
+	vw_affine = false;
+	if(input.affine()) set_volumetric_wall_affine(input, embedding); // task 55: only with the six container sections; the accepted path above is unchanged
+	vw_steps_completed = 0ull;
+	vw_enabled = true;
+}
+void LBM_Domain::set_volumetric_wall_affine(const fluidx3d::experimental::VolumetricWallNativeInput& input, const fluidx3d::experimental::VolumetricWallEmbedding& embedding) { // task 55: buffers and kernels of the affine transport candidate (TASK55_ONESTEP_REFERENCE section 1, projected trial)
+	using namespace fluidx3d::experimental;
+	const std::vector<std::int64_t>& rindex = embedding.r_index_of_cell();
+	const NativeDirections& dir = embedding.directions();
+	const uint q = input.velocity_set; // task 98
+	const double arm_zero = 1e-9; // the threshold of the CPU reference (t53_screen.py): an arm of a donor without a gradient must be below it
+	// gradient cells: all must be R cells; gradient index of every R cell
+	std::vector<int> grad_of_r(vw_rcells, -1);
+	vw_gcount = (uint)input.gradient_cells.size();
+	for(uint g=0u; g<vw_gcount; g++) {
+		const std::int64_t r = rindex[input.gradient_cells[g]];
+		if(r<0) throw std::invalid_argument("affine: a gradient cell is not an R cell");
+		grad_of_r[(size_t)r] = (int)g;
+	}
+	// support cells: stencil cells outside R, ascending mesh order; extended index = R index, or rcells + support index
+	std::vector<std::uint32_t> support;
+	for(const std::uint32_t cell : input.gradient_indices) if(rindex[cell]<0) support.push_back(cell);
+	std::sort(support.begin(), support.end());
+	support.erase(std::unique(support.begin(), support.end()), support.end());
+	vw_scount = (uint)support.size();
+	std::vector<ulong> scells(vw_scount);
+	std::map<std::uint32_t, uint> support_index;
+	for(uint s=0u; s<vw_scount; s++) { scells[s] = (ulong)embedding.lattice_of_cell()[support[s]]; support_index[support[s]] = s; }
+	std::vector<uint> gext(input.gradient_indices.size());
+	for(size_t z=0u; z<gext.size(); z++) { const std::uint32_t cell = input.gradient_indices[z]; gext[z] = rindex[cell]>=0 ? (uint)rindex[cell] : vw_rcells+support_index.at(cell); }
+	// G entries: arm and the gradient index of the donor (every G donor must have a gradient)
+	std::vector<uint> gdon(input.G.indices.size());
+	for(size_t z=0u; z<gdon.size(); z++) {
+		const int g = grad_of_r[(size_t)rindex[input.G.indices[z]/q]];
+		if(g<0) throw std::invalid_argument("affine: a gather donor has no gradient");
+		gdon[z] = (uint)g;
+	}
+	// native rows: the ordinary kernel streams them without an arm term, so their direct arms must be zero
+	for(const std::int64_t state : embedding.native_rows()) {
+		for(uint z=input.D.offsets[(size_t)state]; z<input.D.offsets[(size_t)state+1u]; z++) {
+			for(uint q=0u; q<3u; q++) if(std::fabs(input.direct_arm[3u*z+q])>arm_zero) throw std::invalid_argument("affine: a state streamed by the ordinary kernel has a direct arm");
+		}
+	}
+	// owned rows, in the order of set_volumetric_wall: D entries (arm, donor gradient), R entries (arm and h/V of the matching G entry), receiver
+	std::vector<double> darm, rarm, rsw;
+	std::vector<int> dgrad, ograd(vw_owned, -1);
+	std::vector<uint> ocell(vw_owned);
+	for(uint o=0u; o<vw_owned; o++) {
+		const NativeOwnedRow& row = embedding.owned()[o];
+		const uint state = row.receiver_cell*q+row.direction;
+		const std::int64_t x = rindex[row.receiver_cell]; // an owned row may write into an ordinary cell (rows_r_to_ordinary): its direct arm term applies, it has no capture entry
+		if(x<0 && input.R.offsets[state]<input.R.offsets[state+1u]) throw std::invalid_argument("affine: a scatter receiver is outside R");
+		ocell[o] = x<0 ? 0xFFFFFFFFu : (uint)x;
+		for(uint z=input.D.offsets[state]; z<input.D.offsets[state+1u]; z++) {
+			const int g = grad_of_r[(size_t)rindex[input.D.indices[z]/q]];
+			double size = 0.0;
+			for(uint q=0u; q<3u; q++) { darm.push_back(input.direct_arm[3u*z+q]); size = std::max(size, std::fabs(input.direct_arm[3u*z+q])); }
+			if(g<0 && size>arm_zero) throw std::invalid_argument("affine: a direct donor with an arm has no gradient");
+			dgrad.push_back(g);
+		}
+		if(input.R.offsets[state]<input.R.offsets[state+1u]) {
+			ograd[o] = grad_of_r[(size_t)ocell[o]];
+			if(ograd[o]<0) throw std::invalid_argument("affine: a scatter receiver has no gradient");
+		}
+		const uint opposite = dir.lex_opposite(row.direction);
+		for(uint z=input.R.offsets[state]; z<input.R.offsets[state+1u]; z++) {
+			const uint r = input.R.indices[z];
+			if(input.row_direction[r]!=row.direction) throw std::invalid_argument("affine: a scatter entry has another direction than its row");
+			bool found = false;
+			for(uint y=input.G.offsets[r]; y<input.G.offsets[r+1u]; y++) {
+				if(input.G.indices[y]==row.receiver_cell*q+opposite) {
+					for(uint q=0u; q<3u; q++) rarm.push_back(input.prism_arm[3u*y+q]);
+					rsw.push_back(input.G.weights[y]/input.volume[row.receiver_cell]); // h / V_x, as the reference
+					found = true;
+					break;
+				}
+			}
+			if(!found) throw std::invalid_argument("affine: a scatter entry has no gather entry of the same prism part");
+		}
+	}
+	vw_upload(device, vw_scells, scells); vw_upload(device, vw_goff, input.gradient_offsets); vw_upload(device, vw_gext, gext); vw_upload(device, vw_gwt, input.gradient_weights);
+	vw_upload(device, vw_garm, input.prism_arm); vw_upload(device, vw_gdon, gdon);
+	vw_upload(device, vw_darm, darm); vw_upload(device, vw_dgrad, dgrad); vw_upload(device, vw_rarm, rarm); vw_upload(device, vw_rsw, rsw);
+	vw_upload(device, vw_ocell, ocell); vw_upload(device, vw_ograd, ograd);
+	vw_spost = Memory<double>(device, (ulong)q*std::max(1u, vw_scount)); vw_sfields = Memory<double>(device, 4ull*std::max(1u, vw_scount));
+	vw_grad = Memory<double>(device, 3ull*((ulong)q+4ull)*std::max(1u, vw_gcount)); vw_ebar = Memory<double>(device, (ulong)vw_rows);
+	vw_upload(device, vw_returned, std::vector<double>((ulong)q*vw_rcells, 0.0)); // states that no wall kernel writes stay 0 (agreed capture convention)
+	vw_upload(device, vw_dinc, std::vector<double>((ulong)q*vw_rcells, 0.0));
+	vw_kernel_gradient = Kernel(device, (ulong)std::max(1u, vw_gcount), "vw_gradient", vw_gcount, vw_rcells, vw_goff, vw_gext, vw_gwt, vw_post, vw_fields, vw_spost, vw_sfields, vw_grad);
+#ifdef VOLUMETRIC_WALL_RR27
+	{ // task 98: the gradient index of the cell of every sampler entry (every sample cell is a gradient cell), the capture buffers, the RR27 kernels
+		std::vector<uint> sgrad(input.S.indices.size());
+		for(size_t z=0u; z<sgrad.size(); z++) {
+			const std::int64_t r = rindex[input.S.indices[z]];
+			const int g = r<0 ? -1 : grad_of_r[(size_t)r];
+			if(g<0) throw std::invalid_argument("RR27: a sample cell has no gradient (the wall-extrapolated reference reads S[L rho] and S[L u])");
+			sgrad[z] = (uint)g;
+		}
+		vw_upload(device, vw_sgrad, sgrad);
+		vw_upload(device, vw_wstate, std::vector<double>(4ull*vw_facets, 0.0));
+		vw_upload(device, vw_delta, std::vector<double>((size_t)vw_facets, 0.0));
+		vw_wfail = Memory<uint>(device, 1ull, 1u, true, true, 0u);
+		vw_wfail.write_to_device();
+	}
+	vw_kernel_support = Kernel(device, (ulong)std::max(1u, vw_scount), "vw_support_rr27", vw_scount, vw_scells, vw_fx2lex, vw_c, fi, t, input.omega, fx, fy, fz, vw_spost, vw_sfields);
+	vw_kernel_wall_affine0 = Kernel(device, (ulong)vw_facets, "vw_wall_rr27", vw_facets, input.friction, vw_c, vw_fo, vw_rd, vw_vi, vw_normal, vw_so, vw_si, vw_sw, vw_sgrad, vw_go, vw_gi, vw_gw, vw_post, vw_fields, vw_pending0, vw_incoming, vw_Q, vw_impulse, vw_phi, vw_garm, vw_gdon, vw_grad, vw_ebar, vw_wstate, vw_delta, vw_wfail);
+	vw_kernel_wall_affine1 = Kernel(device, (ulong)vw_facets, "vw_wall_rr27", vw_facets, input.friction, vw_c, vw_fo, vw_rd, vw_vi, vw_normal, vw_so, vw_si, vw_sw, vw_sgrad, vw_go, vw_gi, vw_gw, vw_post, vw_fields, vw_pending1, vw_incoming, vw_Q, vw_impulse, vw_phi, vw_garm, vw_gdon, vw_grad, vw_ebar, vw_wstate, vw_delta, vw_wfail);
+#else // VOLUMETRIC_WALL_RR27
+	vw_kernel_support = Kernel(device, (ulong)std::max(1u, vw_scount), "vw_support", vw_scount, vw_scells, vw_fx2lex, vw_c, fi, t, fx, fy, fz, vw_spost, vw_sfields);
+	vw_kernel_wall_affine0 = Kernel(device, (ulong)vw_facets, "vw_wall_affine", vw_facets, input.friction, vw_c, vw_fo, vw_rd, vw_vi, vw_normal, vw_area, vw_so, vw_si, vw_sw, vw_go, vw_gi, vw_gw, vw_post, vw_fields, vw_pending0, vw_incoming, vw_Q, vw_impulse, vw_phi, vw_garm, vw_gdon, vw_grad, vw_ebar);
+	vw_kernel_wall_affine1 = Kernel(device, (ulong)vw_facets, "vw_wall_affine", vw_facets, input.friction, vw_c, vw_fo, vw_rd, vw_vi, vw_normal, vw_area, vw_so, vw_si, vw_sw, vw_go, vw_gi, vw_gw, vw_post, vw_fields, vw_pending1, vw_incoming, vw_Q, vw_impulse, vw_phi, vw_garm, vw_gdon, vw_grad, vw_ebar);
+#endif // VOLUMETRIC_WALL_RR27
+	const ulong stream_range = (ulong)vw_owned+(ulong)vw_rows;
+	vw_kernel_stream_affine01 = Kernel(device, stream_range, "vw_stream_pending_affine", vw_owned, vw_rows, vw_c, vw_odir, vw_addr0, vw_addr1, t, vw_doff, vw_di, vw_dw, vw_ro, vw_ri, vw_rw, vw_post, vw_Q, vw_wo, vw_wi, vw_ww, vw_vi, vw_pending1, fi, vw_prestore,
+		vw_darm, vw_dgrad, vw_rarm, vw_rsw, vw_ocell, vw_ograd, vw_fields, vw_grad, vw_ebar, vw_returned, vw_dinc);
+	vw_kernel_stream_affine10 = Kernel(device, stream_range, "vw_stream_pending_affine", vw_owned, vw_rows, vw_c, vw_odir, vw_addr0, vw_addr1, t, vw_doff, vw_di, vw_dw, vw_ro, vw_ri, vw_rw, vw_post, vw_Q, vw_wo, vw_wi, vw_ww, vw_vi, vw_pending0, fi, vw_prestore,
+		vw_darm, vw_dgrad, vw_rarm, vw_rsw, vw_ocell, vw_ograd, vw_fields, vw_grad, vw_ebar, vw_returned, vw_dinc);
+	vw_affine = true;
+	print_info("volumetric wall AFFINE candidate (task 55): "+to_string(vw_gcount)+" gradient cells, "+to_string(vw_scount)+" support cells");
+}
+void LBM_Domain::enqueue_volumetric_wall_load() {
+	vw_kernel_load.set_parameters(5u, t).enqueue_run();
+#ifdef VOLUMETRIC_WALL_RR27
+	if(vw_affine&&vw_scount>0u) { // task 98: the support cells collide in FP64 from their level-t state BEFORE stream_collide (it reads the same load set and then overwrites it)
+		vw_kernel_support.set_parameters(5u, t);
+		vw_kernel_support.set_parameters(7u, fx, fy, fz);
+		vw_kernel_support.enqueue_run();
+	}
+#endif // VOLUMETRIC_WALL_RR27
+}
+void LBM_Domain::enqueue_volumetric_wall_step() {
+#ifdef VOLUME_FORCE
+	vw_kernel_collide.set_parameters(9u, fx, fy, fz); // task 43 (#979): the same current force as enqueue_stream_collide gives the ordinary kernel, so set_f/set_fx/set_fy/set_fz cannot diverge
+#endif // VOLUME_FORCE
+	vw_kernel_collide.enqueue_run();
+	if(vw_affine) { // task 55: support read (after stream_collide, before any wall store), gradients, affine wall, affine stream
+#ifndef VOLUMETRIC_WALL_RR27 // task 98: with RR27 the support cells were collided in enqueue_volumetric_wall_load
+		vw_kernel_support.set_parameters(5u, t);
+#ifdef VOLUME_FORCE
+		vw_kernel_support.set_parameters(6u, fx, fy, fz);
+#endif // VOLUME_FORCE
+		vw_kernel_support.enqueue_run();
+#endif // VOLUMETRIC_WALL_RR27
+		vw_kernel_gradient.enqueue_run();
+		if(vw_pending_slot==0u) { vw_kernel_wall_affine0.enqueue_run(); vw_kernel_stream_affine01.set_parameters(6u, t).enqueue_run(); }
+		else { vw_kernel_wall_affine1.enqueue_run(); vw_kernel_stream_affine10.set_parameters(6u, t).enqueue_run(); }
+	} else {
+		if(vw_pending_slot==0u) { vw_kernel_wall0.enqueue_run(); vw_kernel_stream01.set_parameters(6u, t).enqueue_run(); } // wall reads pending0, stream writes pending1
+		else { vw_kernel_wall1.enqueue_run(); vw_kernel_stream10.set_parameters(6u, t).enqueue_run(); }
+	}
+	vw_pending_slot = 1u-vw_pending_slot; // host-side swap after the launches are enqueued; every facet consumed the old pending in vw_wall before vw_stream_pending started (in-order queue)
+	vw_steps_completed++;
+}
+void LBM_Domain::enqueue_volumetric_wall_initial_state() { vw_kernel_seed.enqueue_run(); } // after initialize(): every fluid cell's level-0 load set rewritten with the declared pre-collision state
+#ifdef VOLUMETRIC_WALL_RR27
+void LBM_Domain::volumetric_wall_failure_counts(uint& wall_state_failures, uint& clamps) { // #2034: the two counters, read after the queue is finished
+	device.finish_queue();
+	wall_state_failures = vw_affine ? vw_download(vw_wfail)[0] : 0u;
+	clamps = vw_download(vw_clamp)[0];
+}
+#endif // VOLUMETRIC_WALL_RR27
+fluidx3d::experimental::VolumetricWallNativeCapture LBM_Domain::read_volumetric_wall_buffers() {
+	fluidx3d::experimental::VolumetricWallNativeCapture capture;
+	device.finish_queue();
+	capture.available = vw_steps_completed>0ull; // before the first wall step the buffers hold no level (#273)
+	capture.t = t;
+	if(!capture.available) { capture.clamp_count = vw_download(vw_clamp)[0]; return capture; }
+	capture.gpre = vw_download(vw_gpre); capture.f = vw_download(vw_f); capture.post = vw_download(vw_post); capture.fields = vw_download(vw_fields);
+	capture.incoming = vw_download(vw_incoming); capture.Q = vw_download(vw_Q); capture.impulse = vw_download(vw_impulse); capture.prestore = vw_download(vw_prestore);
+	capture.pending_new = vw_download(vw_pending_slot==0u ? vw_pending0 : vw_pending1);
+	capture.pending_old = vw_download(vw_pending_slot==0u ? vw_pending1 : vw_pending0);
+	capture.clamp_count = vw_download(vw_clamp)[0];
+	if(vw_affine) { capture.support_post = vw_download(vw_spost); capture.returned = vw_download(vw_returned); capture.direct_increment = vw_download(vw_dinc); } // task 55
+#ifdef VOLUMETRIC_WALL_RR27
+	capture.wall_state = vw_download(vw_wstate); capture.delta = vw_download(vw_delta); capture.wall_state_failures = vw_download(vw_wfail)[0]; // task 98
+#endif // VOLUMETRIC_WALL_RR27
+	return capture;
+}
+void LBM_Domain::vw_read_fi(vector<fpxx>& host) { host.resize(fi.range()); device.finish_queue(); device.get_cl_queue().enqueueReadBuffer(fi.get_cl_buffer(), CL_TRUE, 0ull, fi.capacity(), (void*)host.data()); }
+void LBM_Domain::vw_write_fi(const vector<fpxx>& host) { if((ulong)host.size()!=fi.range()) print_error("vw_write_fi(): wrong size"); device.finish_queue(); device.get_cl_queue().enqueueWriteBuffer(fi.get_cl_buffer(), CL_TRUE, 0ull, fi.capacity(), (const void*)host.data()); }
+void LBM_Domain::vw_read_pending(vector<double>& host) { device.finish_queue(); host = vw_download(vw_pending_slot==0u ? vw_pending0 : vw_pending1); }
+void LBM_Domain::vw_write_pending(const vector<double>& host) {
+	if((ulong)host.size()!=(ulong)vw_rows) print_error("vw_write_pending(): wrong size");
+	Memory<double>& current = vw_pending_slot==0u ? vw_pending0 : vw_pending1;
+	for(size_t i=0u; i<host.size(); i++) current[(ulong)i] = host[i];
+	current.write_to_device();
+}
+void LBM::attach_volumetric_wall(const fluidx3d::experimental::VolumetricWallNativeInput& input, const std::vector<double>& friction_rows) { // the common part of both attachments; throws, the callers report
+	using namespace fluidx3d::experimental;
+	if(initialized) throw std::logic_error("call it before run()");
+	if(get_D()!=1u) throw std::logic_error("VOLUMETRIC_WALL requires one domain");
+	if(lbm_domain[0]->volumetric_wall_enabled()) throw std::logic_error("a wall is already attached (a second attachment is refused: the first one's TYPE_V flags and buffers would remain)"); // #979
+	if(input.box[0]!=(int)Nx||input.box[1]!=(int)Ny||input.box[2]!=(int)Nz) throw std::invalid_argument("the container box differs from the lattice");
+	const ulong N = get_N();
+	std::vector<std::uint8_t> solid((size_t)N);
+	for(ulong n=0ull; n<N; n++) solid[(size_t)n] = (flags[n]&TYPE_S)!=0u ? 1u : 0u; // TYPE_S bit (TYPE_BO is device-side only)
+	const VolumetricWallEmbedding embedding(input, solid); // input and solid outlive the embedding within this function
+	for(const std::int64_t cell : embedding.r_cells()) flags[embedding.lattice_of_cell()[(size_t)cell]] |= TYPE_V;
+	lbm_domain[0]->set_volumetric_wall(input, embedding, friction_rows);
+}
+void LBM::set_volumetric_wall(const string& vwnat_path) { // the supported path (task 43): geometry-bound friction rows from the container, coefficient identities checked, fail closed
+	using namespace fluidx3d::experimental;
+	try {
+		const VolumetricWallNativeInput input = VolumetricWallNativeInput::read(vwnat_path);
+		input.validate();
+#ifdef VOLUMETRIC_WALL_RR27
+		if(!input.affine()) throw std::invalid_argument("VOLUMETRIC_WALL_RR27 needs the affine container sections (arms, gradient map) and the friction rows (task 98)"); // task 98 (#1999): before the D3Q19 friction-row validation, so this guard decides
+#endif // VOLUMETRIC_WALL_RR27
+		if(input.affine()) input.validate_affine(); // task 55: the candidate sections; rows: tensor identity and tangency only (base rows have a shell sum)
+		else input.validate_friction_rows(); // absent section, wrong geometry or row order, rows with shell mass: refused
+		attach_volumetric_wall(input, input.friction_rows);
+		const VolumetricWallNativeInput::FrictionRowResiduals& r = input.friction_row_residuals;
+		char text[256] = {};
+		std::snprintf(text, sizeof(text), "volumetric wall: friction rows from the container, coefficient identities checked (residuals / A: shell %.3e, impulse tensor %.3e, normal %.3e)", r.shell_sum, r.impulse_tensor, r.normal_component);
+		print_info(string(text));
+	} catch(const std::exception& error) {
+		print_error(string("set_volumetric_wall(): ")+error.what());
+	}
+}
+void LBM::set_volumetric_wall_research(const string& vwnat_path, const string& rows_path) { // archived fixtures: the original kernel expression, or an unvalidated rows file (the former VW_PHI)
+	using namespace fluidx3d::experimental;
+	try {
+		const VolumetricWallNativeInput input = VolumetricWallNativeInput::read(vwnat_path);
+		input.validate();
+		if(input.affine()) throw std::invalid_argument("the affine candidate container (task 55) is attached only through the supported path set_volumetric_wall");
+		std::vector<double> rows_from_file;
+		if(!rows_path.empty()) {
+			rows_from_file.assign((size_t)input.rows*3u, 0.0);
+			std::ifstream in(rows_path, std::ios::binary);
+			if(!in) throw std::invalid_argument("cannot open the rows file"); // no path in the message: print_error fails on a long word without spaces
+			in.read((char*)rows_from_file.data(), (std::streamsize)(rows_from_file.size()*sizeof(double)));
+			if(!in || in.peek()!=std::ifstream::traits_type::eof()) throw std::invalid_argument("the rows file is not rows*3 doubles");
+		}
+		attach_volumetric_wall(input, rows_from_file);
+		if(rows_path.empty()) print_info("volumetric wall RESEARCH path: the original kernel friction expression");
+		else print_info("volumetric wall RESEARCH path: friction rows from the file "+rows_path+" (not checked against the geometry)");
+	} catch(const std::exception& error) {
+		print_error(string("set_volumetric_wall_research(): ")+error.what());
+	}
+}
+#endif // VOLUMETRIC_WALL

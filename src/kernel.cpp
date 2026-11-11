@@ -1372,6 +1372,378 @@ string opencl_c_container() { return R( // ########################## begin of O
 	}
 }
 
+)+"#ifdef VOLUMETRIC_WALL"+R(
+// Task 19 (2026-11-08): native volumetric free-slip wall, the CF10 bounded operator (collide, facet trial, shell
+// balance, pending inventory, direct/scatter transport) on the R region in FP64, with the native FP32 shifted fi as
+// the only persistent population storage (CF9 convention). Directions inside these kernels are lexicographic D3Q19
+// (vw_c); the FluidX3D order is used only at the fi boundary through vw_fx2lex / vw_lex2fx. Ownership and the
+// level-(t+1) addresses are decided on the host (experimental/volumetric_wall_native.cpp) and uploaded.
+double vw_weight(const int d, const global int* c) { // rest weight of lexicographic direction d: D3Q19 1/3, 1/18, 1/36; D3Q27 (task 98) 8/27, 2/27, 1/54, 1/216 (correctly rounded doubles)
+ const int s=c[3*d]*c[3*d]+c[3*d+1]*c[3*d+1]+c[3*d+2]*c[3*d+2];
+)+"#ifdef D3Q27"+R(
+ return s==0 ? 8.0/27.0 : (s==1 ? 2.0/27.0 : (s==2 ? 1.0/54.0 : 1.0/216.0));
+)+"#else"+R( // D3Q27
+ return s==0 ? 1.0/3.0 : (s==1 ? 1.0/18.0 : 1.0/36.0);
+)+"#endif"+R( // D3Q27
+}
+)+"#ifdef VOLUMETRIC_WALL_RR27"+R(
+// Task 98: the RR collision with the full force term of the frozen reference (t87_model.py Equilibrium and Model27.collide;
+// TASK95_ACCEPTED_FORMULATION_SPEC Section 4 step 1), in FP64, for one cell. cx, cy, cz, wq: the directions and the double
+// weights in the caller's order (lexicographic in the wall kernels, FluidX3D order in stream_collide); f: the physical
+// populations; F: the force density (the float32 values widened). p = feq + (1 - omega) fneq_RR + Phi/2 with
+// u = (j + F/2)/rho, B = 1 + 3cu + 9/2 cu^2 - 3/2 uu + 9/2 (cu^3 - cu uu), feq = w rho B, Phi = 3 (c.F - u.F) w B,
+// A = sum c c (f + Phi/2) - rho/3 I - rho u u, fneq = w [9/2 (cAc - trA/3) + 27/2 (cu cAc - (cu trA + 2 u.A.c)/3)].
+void vw_rr27(const double* f, const double* cx, const double* cy, const double* cz, const double* wq, const double omega, const double3 F, double* p) {
+ double rho=0.0, jx=0.0, jy=0.0, jz=0.0;
+ for(uint i=0u; i<def_velocity_set; i++) { rho+=f[i]; jx+=f[i]*cx[i]; jy+=f[i]*cy[i]; jz+=f[i]*cz[i]; }
+ const double ux=(jx+0.5*F.x)/rho, uy=(jy+0.5*F.y)/rho, uz=(jz+0.5*F.z)/rho;
+ const double uu=ux*ux+uy*uy+uz*uz, uF=ux*F.x+uy*F.y+uz*F.z;
+ double feq[def_velocity_set], phi[def_velocity_set];
+ double sxx=0.0, syy=0.0, szz=0.0, sxy=0.0, sxz=0.0, syz=0.0;
+ for(uint i=0u; i<def_velocity_set; i++) {
+  const double cu=cx[i]*ux+cy[i]*uy+cz[i]*uz;
+  const double B=1.0+3.0*cu+4.5*cu*cu-1.5*uu+4.5*(cu*cu*cu-cu*uu);
+  feq[i]=wq[i]*rho*B;
+  phi[i]=3.0*((cx[i]*F.x+cy[i]*F.y+cz[i]*F.z)-uF)*wq[i]*B;
+  const double g=f[i]+0.5*phi[i];
+  sxx+=cx[i]*cx[i]*g; syy+=cy[i]*cy[i]*g; szz+=cz[i]*cz[i]*g; sxy+=cx[i]*cy[i]*g; sxz+=cx[i]*cz[i]*g; syz+=cy[i]*cz[i]*g;
+ }
+ const double Axx=sxx-rho/3.0-rho*ux*ux, Ayy=syy-rho/3.0-rho*uy*uy, Azz=szz-rho/3.0-rho*uz*uz;
+ const double Axy=sxy-rho*ux*uy, Axz=sxz-rho*ux*uz, Ayz=syz-rho*uy*uz;
+ const double trA=Axx+Ayy+Azz;
+ for(uint i=0u; i<def_velocity_set; i++) {
+  const double cu=cx[i]*ux+cy[i]*uy+cz[i]*uz;
+  const double Acx=Axx*cx[i]+Axy*cy[i]+Axz*cz[i], Acy=Axy*cx[i]+Ayy*cy[i]+Ayz*cz[i], Acz=Axz*cx[i]+Ayz*cy[i]+Azz*cz[i]; // A c
+  const double cAc=cx[i]*Acx+cy[i]*Acy+cz[i]*Acz, uAc=ux*Acx+uy*Acy+uz*Acz;
+  const double second=cAc-trA/3.0, third=cu*cAc-(cu*trA+2.0*uAc)/3.0;
+  const double fneq=wq[i]*(4.5*second+13.5*third);
+  p[i]=feq[i]+(1.0-omega)*fneq+0.5*phi[i];
+ }
+}
+void vw_lex_tables(const global int* c, double* cx, double* cy, double* cz, double* wq) { // the lexicographic directions and double weights of the wall kernels
+ for(uint d=0u; d<def_velocity_set; d++) { cx[d]=(double)c[3u*d]; cy[d]=(double)c[3u*d+1u]; cz[d]=(double)c[3u*d+2u]; wq[d]=vw_weight((int)d, c); }
+}
+bool vw_finite(const double x) { // bit test: the device program is built with -cl-finite-math-only, so isfinite is not trusted
+ return ((as_ulong(x)>>52)&0x7FFul)!=0x7FFul;
+}
+)+"#endif"+R( // VOLUMETRIC_WALL_RR27
+kernel void vw_load(const uint rcells, const global ulong* cells, const global int* fx2lex, const global int* c, const global fpxx* fi, const ulong t, global double* f, global float* gpre) { // level-t states of the R cells: actual stored g (gpre) and f = fl64(w + g)
+ const uint r=get_global_id(0); if(r>=rcells) return;
+ const uxx n=(uxx)cells[r]; uxx j[def_velocity_set]; neighbors(n, j);
+ float fhn[def_velocity_set]; load_f(n, fhn, fi, j, t);
+ for(uint k=0u; k<def_velocity_set; k++) { const int d=fx2lex[k]; gpre[def_velocity_set*r+(uint)d]=fhn[k]; f[def_velocity_set*r+(uint)d]=vw_weight(d, c)+(double)fhn[k]; }
+}
+kernel void vw_collide)+"("+R(const uint rcells, const double omega, const global int* c, const global double* f, global double* post, global double* fields, const global ulong* cells, global float* rho, global float* u // the parameter list is opened and closed by string pieces, as stream_collide: a macro argument must keep its parentheses balanced
+)+"#ifdef VOLUME_FORCE"+R(
+ , const float fx, const float fy, const float fz // task 43: the uniform force density of the ordinary kernel (the same float values), given at every dispatch
+)+"#endif"+R( // VOLUME_FORCE
+)+") {"+R( // BGK in FP64 (vw64_collide); the field cache of R cells gets the level-t rho and physical u
+ const uint a=get_global_id(0); if(a>=rcells) return;
+)+"#ifdef VOLUMETRIC_WALL_RR27"+R(
+ { // task 98: the RR collision (vw_rr27) instead of BGK; post, fields rho_p and u_p = (sum c p - F/2)/rho_p, the field cache (level-t rho and physical u)
+  double cx[def_velocity_set], cy[def_velocity_set], cz[def_velocity_set], wq[def_velocity_set], fl[def_velocity_set], pl[def_velocity_set];
+  vw_lex_tables(c, cx, cy, cz, wq);
+  for(uint i=0u; i<def_velocity_set; i++) fl[i]=f[def_velocity_set*a+i];
+)+"#ifdef VOLUME_FORCE"+R(
+  const double3 Fr=(double3)((double)fx, (double)fy, (double)fz);
+)+"#else"+R( // VOLUME_FORCE
+  const double3 Fr=(double3)(0.0);
+)+"#endif"+R( // VOLUME_FORCE
+  vw_rr27(fl, cx, cy, cz, wq, omega, Fr, pl);
+  double rr=0.0, jrx=0.0, jry=0.0, jrz=0.0, rf=0.0, jfx=0.0, jfy=0.0, jfz=0.0;
+  for(uint i=0u; i<def_velocity_set; i++) { post[def_velocity_set*a+i]=pl[i]; rr+=pl[i]; jrx+=pl[i]*cx[i]; jry+=pl[i]*cy[i]; jrz+=pl[i]*cz[i]; rf+=fl[i]; jfx+=fl[i]*cx[i]; jfy+=fl[i]*cy[i]; jfz+=fl[i]*cz[i]; }
+  const double3 upr=((double3)(jrx, jry, jrz)-0.5*Fr)/rr;
+  fields[4u*a]=rr; vstore3(upr, 0, fields+4u*a+1u);
+  const double3 upre=((double3)(jfx, jfy, jfz)+0.5*Fr)/rf; // the level-t physical velocity of the field cache
+  const uxx nr=(uxx)cells[a]; rho[nr]=(float)rf; store3(u, nr, (float3)((float)upre.x, (float)upre.y, (float)upre.z));
+  return;
+ }
+)+"#endif"+R( // VOLUMETRIC_WALL_RR27
+ double rhoa=0.0; double3 jm=(double3)(0.0);
+ for(int i=0; i<(int)def_velocity_set; i++) { const double v=f[def_velocity_set*a+(uint)i]; rhoa+=v; jm+=v*convert_double3(vload3(i, c)); }
+)+"#ifdef VOLUME_FORCE"+R( // task 43, Guo forcing as stream_collide: u = (j + F/2)/rho, source (1 - omega/2) w_i (3 (c_i - u).F + 9 (c_i.u)(c_i.F)); mass is kept and the momentum density gains exactly F
+ const double3 F=(double3)((double)fx, (double)fy, (double)fz);
+ const double3 ua=(jm+0.5*F)/rhoa; const double uF=dot(ua, F);
+)+"#else"+R( // VOLUME_FORCE
+ const double3 ua=jm/rhoa;
+)+"#endif"+R( // VOLUME_FORCE
+ const double u2=dot(ua, ua); double rp=0.0; double3 jp=(double3)(0.0);
+)+"#ifdef SUBGRID"+R( // task 45: the Smagorinsky closure of stream_collide in FP64. H = sum c c (f - feq(rho, u)) of the level-t populations, u the velocity the collision uses (force-shifted under VOLUME_FORCE; the force part of H is NOT removed, as in the ordinary kernel); Q = H:H; local rate w = 2/(tau0 + sqrt(tau0^2 + A sqrt(Q)/rho)), tau0 = 1/omega, A = the ordinary kernel's float constant 0.76421222f converted exactly. The relaxation AND the force prefactor 1 - w/2 use this local rate.
+ double Hxx=0.0, Hyy=0.0, Hzz=0.0, Hxy=0.0, Hxz=0.0, Hyz=0.0;
+ for(int i=0; i<(int)def_velocity_set; i++) {
+  const double3 ci=convert_double3(vload3(i, c)); const double cu=dot(ci, ua);
+  const double fneq=f[def_velocity_set*a+(uint)i]-vw_weight(i, c)*rhoa*(1.0+3.0*cu+4.5*cu*cu-1.5*u2);
+  Hxx+=ci.x*ci.x*fneq; Hyy+=ci.y*ci.y*fneq; Hzz+=ci.z*ci.z*fneq; Hxy+=ci.x*ci.y*fneq; Hxz+=ci.x*ci.z*fneq; Hyz+=ci.y*ci.z*fneq;
+ }
+ const double sgs_Q=Hxx*Hxx+Hyy*Hyy+Hzz*Hzz+2.0*(Hxy*Hxy+Hxz*Hxz+Hyz*Hyz); const double sgs_tau0=1.0/omega;
+ const double wl=2.0/(sgs_tau0+sqrt(sgs_tau0*sgs_tau0+(double)0.76421222f*sqrt(sgs_Q)/rhoa));
+)+"#else"+R( // SUBGRID
+ const double wl=omega;
+)+"#endif"+R( // SUBGRID
+ for(int i=0; i<(int)def_velocity_set; i++) {
+  const double3 ci=convert_double3(vload3(i, c)); const double cu=dot(ci, ua);
+  const double feq=vw_weight(i, c)*rhoa*(1.0+3.0*cu+4.5*cu*cu-1.5*u2);
+)+"#ifdef VOLUME_FORCE"+R(
+  const double cF=dot(ci, F);
+  const double v=f[def_velocity_set*a+(uint)i]-wl*(f[def_velocity_set*a+(uint)i]-feq)+(1.0-0.5*wl)*vw_weight(i, c)*(3.0*(cF-uF)+9.0*cu*cF); post[def_velocity_set*a+(uint)i]=v; rp+=v; jp+=v*ci;
+)+"#else"+R( // VOLUME_FORCE
+  const double v=f[def_velocity_set*a+(uint)i]-wl*(f[def_velocity_set*a+(uint)i]-feq); post[def_velocity_set*a+(uint)i]=v; rp+=v; jp+=v*ci;
+)+"#endif"+R( // VOLUME_FORCE
+ }
+)+"#ifdef VOLUME_FORCE"+R( // the post-collision momentum is j + F: the physical velocity of level t is (jp - F/2)/rho; the wall law, the even trial and the traction ledger read it from fields. Bitwise jp/rp at F = 0.
+ const double3 up=(jp-0.5*F)/rp;
+)+"#else"+R( // VOLUME_FORCE
+ const double3 up=jp/rp;
+)+"#endif"+R( // VOLUME_FORCE
+ fields[4u*a]=rp; vstore3(up, 0, fields+4u*a+1u);
+ const uxx n=(uxx)cells[a]; rho[n]=(float)rp; store3(u, n, (float3)((float)up.x, (float)up.y, (float)up.z)); // level t; force-free SRT: equal to the pre-collision moments up to rounding; with VOLUME_FORCE the physical velocity, as stream_collide stores it
+}
+kernel void vw_wall(const uint facets, const double K, const global int* c, const global uint* fo, const global uint* rd, const global double* vi, const global double* normals, const global double* areas,
+ const global uint* so, const global uint* si, const global double* sw, const global uint* go, const global uint* gi, const global double* gw,
+ const global double* post, const global double* fields, const global double* s, global double* incoming, global double* Q, global double* impulse, const uint use_phi, const global double* phi) { // one facet: sample, gather + pending, trial, friction, shell balance -> Q, impulse (reads s, never writes it)
+ const uint a=get_global_id(0); if(a>=facets) return;
+ double rho=0.0; double3 u=(double3)(0.0); const double3 nrm=vload3(a, normals);
+ for(uint z=so[a]; z<so[a+1u]; z++) { const uint b=si[z]; rho+=sw[z]*fields[4u*b]; u+=sw[z]*vload3(0, fields+4u*b+1u); }
+ u-=nrm*dot(u, nrm); const double u2=dot(u, u);
+ double inc[(int)def_velocity_set], ret[(int)def_velocity_set]; double2 denom=(double2)(0.0), difference=(double2)(0.0);
+ const uint begin=fo[a], end=fo[a+1u];
+ for(uint row=begin; row<end; row++) {
+  const uint k=row-begin; const int i=(int)rd[row]; const double3 ci=convert_double3(vload3(i, c)); const double cu=dot(ci, u); const double w=vw_weight(i, c);
+  double sum=0.0; for(uint z=go[row]; z<go[row+1u]; z++) sum+=gw[z]*post[gi[z]];
+  sum+=s[row]; // incoming = gathered + pending (bounded operator, line 68)
+  inc[k]=sum; incoming[row]=sum;
+  const double even=2.0*w*rho*(1.0+4.5*cu*cu-1.5*u2), odd=6.0*w*rho*cu;
+  ret[k]=vi[row]*even-sum-(use_phi!=0u ? K*rho*dot(vload3(row, phi), u) : K*vi[row]*(vi[row]/areas[a])*odd); // spike P1: host-precomputed friction rows (zero mass per shell) when use_phi
+  const int shell=(int)dot(ci, ci)-1;
+  if(shell==0) { denom.x+=vi[row]; difference.x+=sum-ret[k]; } else { denom.y+=vi[row]; difference.y+=sum-ret[k]; }
+ }
+ const double2 delta=difference/denom; double3 J=(double3)(0.0);
+ for(uint row=begin; row<end; row++) {
+  const uint k=row-begin; const double3 ci=convert_double3(vload3((int)rd[row], c)); const int shell=(int)dot(ci, ci)-1;
+  const double v=ret[k]+vi[row]*(shell==0 ? delta.x : delta.y); Q[row]=v; J+=(v+inc[k])*ci; // J = sum c (Q + incoming), incoming includes the pending
+ }
+ vstore3(J, a, impulse);
+}
+kernel void vw_stream_pending(const uint owned, const uint rows, const global int* c, const global uint* odir, const global ulong* oaddr0, const global ulong* oaddr1, const ulong t,
+ const global uint* doff, const global uint* di, const global double* dw, const global uint* ro, const global uint* ri, const global double* rw,
+ const global double* post, const global double* Q, const global uint* wo, const global uint* wi, const global double* ww, const global double* vi,
+ global double* snext, global fpxx* fi, global double* prestore) { // after vw_wall completed for every facet: owned states -> fi (RS rounding), pending transfer -> the other pending buffer; disjoint writes, Q read only
+ const uint id=get_global_id(0);
+ if(id<owned) {
+  double value=0.0;
+  for(uint z=doff[id]; z<doff[id+1u]; z++) value+=dw[z]*post[di[z]];
+  for(uint z=ro[id]; z<ro[id+1u]; z++) value+=rw[z]*Q[ri[z]];
+  prestore[id]=value;
+  const double g=value-vw_weight((int)odir[id], c);
+  const ulong addr=t%2ul ? oaddr1[id] : oaddr0[id];
+  store(fi, addr, convert_float_rte(g));
+ } else if(id<owned+rows) {
+  const uint row=id-owned; double sum=0.0;
+  for(uint z=wo[row]; z<wo[row+1u]; z++) sum+=ww[z]*Q[wi[z]]/vi[wi[z]]; // s_next = W (Q / vi)
+  snext[row]=sum;
+ }
+}
+kernel void vw_seed_initial(const global uchar* flags, const global int* mindex, const global int* lex2fx, const global int* c, const global double* f0, global fpxx* fi) { // declared initial level (explicit-state contract, #273): the level-0 PRE-collision populations of EVERY fluid cell from the container's f0 (fl32 RTE of f0 - w), written into its load_f(n, t=0) addresses. The host rejected any fluid cell outside the mesh, so mindex >= 0 here. Replaces initialize()'s "post-collision of step -1" seeding for the whole lattice when the wall is attached.
+ const uxx n=get_global_id(0); if(n>=(uxx)def_N||is_halo(n)||(flags[n]&TYPE_S)) return;
+ uxx j[def_velocity_set]; neighbors(n, j);
+ float fhn[def_velocity_set];
+ const int m=mindex[n];
+ if(m<0) return; // cannot happen after the host check; a fluid cell without a mesh state is left as initialize() made it and the attachment has already refused
+ for(uint d=0u; d<def_velocity_set; d++) fhn[(uint)lex2fx[d]]=convert_float_rte(f0[def_velocity_set*(uint)m+d]-vw_weight((int)d, c));
+ store(fi, index_f(n, 0u), fhn[0]);
+ for(uint i=1u; i<def_velocity_set; i+=2u) { // the parity-0 load set of n: fhn[i] at (n, i+1), fhn[i+1] at (j[i], i)
+  store(fi, index_f(n, i+1u), fhn[i]);
+  store(fi, index_f(j[i], i), fhn[i+1u]);
+ }
+}
+// Task 55 (2026-11-09): the affine transport candidate (task 53 revision 3, finite-amplitude form of
+// TASK55_ONESTEP_REFERENCE section 1 with the projected trial of #1205). Selected on the host by the six optional container
+// sections; the kernels above are not changed and run unchanged when the sections are absent. Cell fields of the gradient:
+// the q post-collision populations (lexicographic), rho, and the physical velocity (j - F/2)/rho. Extended cell index:
+// R cells 0..rcells-1 (post, fields), then the support cells (spost, sfields). Gradient layout: grad[69 g + 3 f + axis].
+void vw_cell_values(const uint e, const uint rcells, const global double* post, const global double* fields, const global double* spost, const global double* sfields, double* m) { // the 23 fields of one extended cell
+ if(e<rcells) { for(uint d=0u; d<def_velocity_set; d++) m[d]=post[def_velocity_set*e+d]; m[def_velocity_set]=fields[4u*e]; m[def_velocity_set+1u]=fields[4u*e+1u]; m[def_velocity_set+2u]=fields[4u*e+2u]; m[def_velocity_set+3u]=fields[4u*e+3u]; }
+ else { const uint s=e-rcells; for(uint d=0u; d<def_velocity_set; d++) m[d]=spost[def_velocity_set*s+d]; m[def_velocity_set]=sfields[4u*s]; m[def_velocity_set+1u]=sfields[4u*s+1u]; m[def_velocity_set+2u]=sfields[4u*s+2u]; m[def_velocity_set+3u]=sfields[4u*s+3u]; }
+}
+double vw_affine_e(const int i, const global int* c, const double rb, const double3 ub, const double3 arm, const global double* gc) { // outgoing quadratic equilibrium of direction i at the part centroid, Taylor form: w {rho E + (arm.grad rho) E + rho [3 c + 9 (c.u) c - 3 u].((grad u) arm)}
+ const double3 ci=convert_double3(vload3(i, c)); const double w=vw_weight(i, c);
+)+"#ifdef VOLUMETRIC_WALL_RR27"+R( // task 98: the feq3 bracket and its velocity slope (t87_model.py Equilibrium.bracket / slope, Model27._outgoing_shape)
+ {
+  const double cub=dot(ci, ub); const double ubb=dot(ub, ub);
+  const double shape=1.0+3.0*cub+4.5*cub*cub-1.5*ubb+4.5*(cub*cub*cub-cub*ubb);
+  const double drho=dot(arm, vload3(def_velocity_set, gc));
+  const double3 du=(double3)(dot(arm, vload3(def_velocity_set+1u, gc)), dot(arm, vload3(def_velocity_set+2u, gc)), dot(arm, vload3(def_velocity_set+3u, gc)));
+  const double3 slope=3.0*ci+9.0*cub*ci-3.0*ub+4.5*(3.0*cub*cub*ci-ubb*ci-2.0*cub*ub);
+  return w*(rb*shape+drho*shape+rb*dot(slope, du));
+ }
+)+"#endif"+R( // VOLUMETRIC_WALL_RR27
+ const double cub=dot(ci, ub); const double shape=1.0+3.0*cub+4.5*cub*cub-1.5*dot(ub, ub);
+ const double drho=dot(arm, vload3(def_velocity_set, gc));
+ const double3 du=(double3)(dot(arm, vload3(def_velocity_set+1u, gc)), dot(arm, vload3(def_velocity_set+2u, gc)), dot(arm, vload3(def_velocity_set+3u, gc)));
+ const double3 slope=3.0*ci+9.0*cub*ci-3.0*ub;
+ return w*(rb*shape+drho*shape+rb*dot(slope, du));
+}
+kernel void vw_support(const uint scount, const global ulong* scells, const global int* fx2lex, const global int* c, const global fpxx* fi, const ulong t, const float fx, const float fy, const float fz, global double* spost, global double* sfields) { // after stream_collide of step t, before any wall store: the post-collision populations that store_f(n, ., t) wrote for the support cells, p = w + (double)g, and their rho and physical velocity
+ const uint s=get_global_id(0); if(s>=scount) return;
+ const uxx n=(uxx)scells[s]; uxx j[def_velocity_set]; neighbors(n, j);
+ float fhn[def_velocity_set];
+ fhn[0]=load(fi, index_f(n, 0u)); // the addresses of store_f(n, fhn, fi, j, t)
+ for(uint i=1u; i<def_velocity_set; i+=2u) {
+  fhn[i   ]=load(fi, index_f(j[i], t%2ul ? i+1u : i   ));
+  fhn[i+1u]=load(fi, index_f(n   , t%2ul ? i    : i+1u));
+ }
+ double rho=0.0; double3 jm=(double3)(0.0);
+ for(uint k=0u; k<def_velocity_set; k++) { const int d=fx2lex[k]; const double p=vw_weight(d, c)+(double)fhn[k]; spost[def_velocity_set*s+(uint)d]=p; }
+ for(int d=0; d<(int)def_velocity_set; d++) { const double p=spost[def_velocity_set*s+(uint)d]; rho+=p; jm+=p*convert_double3(vload3(d, c)); }
+ const double3 F=(double3)((double)fx, (double)fy, (double)fz);
+ const double3 up=(jm-0.5*F)/rho;
+ sfields[4u*s]=rho; vstore3(up, 0, sfields+4u*s+1u);
+}
+kernel void vw_gradient(const uint gcount, const uint rcells, const global uint* goff, const global uint* gext, const global double* gw, const global double* post, const global double* fields, const global double* spost, const global double* sfields, global double* grad) { // grad m_a = sum_y C_ay (m_y - m_a) of the 23 cell fields, three axes
+ const uint g=get_global_id(0); if(g>=gcount) return;
+ double ma[(def_velocity_set+4u)]; vw_cell_values(gext[goff[3u*g]], rcells, post, fields, spost, sfields, ma); // the first stencil entry is the own cell
+ for(uint axis=0u; axis<3u; axis++) {
+  double acc[(def_velocity_set+4u)]; for(uint f=0u; f<(def_velocity_set+4u); f++) acc[f]=0.0;
+  for(uint z=goff[3u*g+axis]; z<goff[3u*g+axis+1u]; z++) {
+   double my[(def_velocity_set+4u)]; vw_cell_values(gext[z], rcells, post, fields, spost, sfields, my);
+   const double C=gw[z];
+   for(uint f=0u; f<(def_velocity_set+4u); f++) acc[f]+=C*(my[f]-ma[f]);
+  }
+  for(uint f=0u; f<(def_velocity_set+4u); f++) grad[3u*(def_velocity_set+4u)*g+3u*f+axis]=acc[f];
+ }
+}
+kernel void vw_wall_affine(const uint facets, const double K, const global int* c, const global uint* fo, const global uint* rd, const global double* vi, const global double* normals, const global double* areas,
+ const global uint* so, const global uint* si, const global double* sw, const global uint* go, const global uint* gi, const global double* gw,
+ const global double* post, const global double* fields, const global double* s, global double* incoming, global double* Q, global double* impulse, const global double* phi,
+ const global double* garm, const global uint* gdon, const global double* grad, global double* ebar) { // vw_wall with the affine gather (arm of every prism part), the container rows phi, the unchanged projected trial and shell balance; and the prism mean ebar of the outgoing equilibrium
+ const uint a=get_global_id(0); if(a>=facets) return;
+ double rho=0.0; double3 u=(double3)(0.0); const double3 nrm=vload3(a, normals);
+ for(uint z=so[a]; z<so[a+1u]; z++) { const uint b=si[z]; rho+=sw[z]*fields[4u*b]; u+=sw[z]*vload3(0, fields+4u*b+1u); }
+ u-=nrm*dot(u, nrm); const double u2=dot(u, u);
+ double inc[(int)def_velocity_set], ret[(int)def_velocity_set]; double2 denom=(double2)(0.0), difference=(double2)(0.0);
+ const uint begin=fo[a], end=fo[a+1u];
+ for(uint row=begin; row<end; row++) {
+  const uint k=row-begin; const int i=(int)rd[row]; const double3 ci=convert_double3(vload3(i, c)); const double cu=dot(ci, u); const double w=vw_weight(i, c);
+  double sum=0.0;
+  for(uint z=go[row]; z<go[row+1u]; z++) { const uint st=gi[z]; sum+=gw[z]*(post[st]+dot(vload3(z, garm), vload3(st%def_velocity_set, grad+3u*(def_velocity_set+4u)*gdon[z]))); }
+  sum+=s[row];
+  inc[k]=sum; incoming[row]=sum;
+  const double even=2.0*w*rho*(1.0+4.5*cu*cu-1.5*u2);
+  ret[k]=vi[row]*even-sum-K*rho*dot(vload3(row, phi), u);
+  const int shell=(int)dot(ci, ci)-1;
+  if(shell==0) { denom.x+=vi[row]; difference.x+=sum-ret[k]; } else { denom.y+=vi[row]; difference.y+=sum-ret[k]; }
+  double he=0.0, H=0.0;
+  for(uint z=go[row]; z<go[row+1u]; z++) { const uint b=gi[z]/def_velocity_set; he+=gw[z]*vw_affine_e(i, c, fields[4u*b], vload3(0, fields+4u*b+1u), vload3(z, garm), grad+3u*(def_velocity_set+4u)*gdon[z]); H+=gw[z]; }
+  ebar[row]=he/H;
+ }
+ const double2 delta=difference/denom; double3 J=(double3)(0.0);
+ for(uint row=begin; row<end; row++) {
+  const uint k=row-begin; const double3 ci=convert_double3(vload3((int)rd[row], c)); const int shell=(int)dot(ci, ci)-1;
+  const double v=ret[k]+vi[row]*(shell==0 ? delta.x : delta.y); Q[row]=v; J+=(v+inc[k])*ci;
+ }
+ vstore3(J, a, impulse);
+}
+kernel void vw_stream_pending_affine(const uint owned, const uint rows, const global int* c, const global uint* odir, const global ulong* oaddr0, const global ulong* oaddr1, const ulong t,
+ const global uint* doff, const global uint* di, const global double* dw, const global uint* ro, const global uint* ri, const global double* rw,
+ const global double* post, const global double* Q, const global uint* wo, const global uint* wi, const global double* ww, const global double* vi,
+ global double* snext, global fpxx* fi, global double* prestore,
+ const global double* darm, const global int* dgrad, const global double* rarm, const global double* rsw, const global uint* ocell, const global int* ograd,
+ const global double* fields, const global double* grad, const global double* ebar, global double* returned, global double* dinc) { // vw_stream_pending with the direct arm term and the centred scatter (R Q unchanged)
+ const uint id=get_global_id(0);
+ if(id<owned) {
+  double base=0.0, increment=0.0, back=0.0;
+  for(uint z=doff[id]; z<doff[id+1u]; z++) {
+   base+=dw[z]*post[di[z]];
+   if(dgrad[z]>=0) increment+=dw[z]*dot(vload3(z, darm), vload3(di[z]%def_velocity_set, grad+3u*(def_velocity_set+4u)*(uint)dgrad[z]));
+  }
+  for(uint z=ro[id]; z<ro[id+1u]; z++) back+=rw[z]*Q[ri[z]];
+  const uint x=ocell[id];
+  if(ro[id]<ro[id+1u]) {
+   const global double* gc=grad+3u*(def_velocity_set+4u)*(uint)ograd[id]; const double rx=fields[4u*x]; const double3 ux=vload3(0, fields+4u*x+1u);
+   for(uint z=ro[id]; z<ro[id+1u]; z++) back+=rsw[z]*(vw_affine_e((int)odir[id], c, rx, ux, vload3(z, rarm), gc)-ebar[ri[z]]);
+  }
+  const double value=base+increment+back;
+  prestore[id]=value;
+  if(x!=0xFFFFFFFFu) { returned[def_velocity_set*x+odir[id]]=back; dinc[def_velocity_set*x+odir[id]]=increment; } // capture of the R states only; a receiver outside R (0xFFFFFFFF) has no scatter
+  const double g=value-vw_weight((int)odir[id], c);
+  const ulong addr=t%2ul ? oaddr1[id] : oaddr0[id];
+  store(fi, addr, convert_float_rte(g));
+ } else if(id<owned+rows) {
+  const uint row=id-owned; double sum=0.0;
+  for(uint z=wo[row]; z<wo[row+1u]; z++) sum+=ww[z]*Q[wi[z]]/vi[wi[z]];
+  snext[row]=sum;
+ }
+}
+)+"#ifdef VOLUMETRIC_WALL_RR27"+R(
+// Task 98: the support cells (ordinary cells in a gradient stencil) collide again in FP64 BEFORE stream_collide, from their
+// level-t state (load_f, f = w + g), with the same function vw_rr27: the gradient reads the FP64 post-collision values of the
+// reference instead of the FP32 values stream_collide stores. Writes spost (q per support cell, lexicographic) and sfields
+// (rho_p, u_p = (sum c p - F/2)/rho_p). It reads only the level-t load set of each support cell, which stream_collide reads too.
+kernel void vw_support_rr27(const uint scount, const global ulong* scells, const global int* fx2lex, const global int* c, const global fpxx* fi, const ulong t, const double omega,
+ const float fx, const float fy, const float fz, global double* spost, global double* sfields) {
+ const uint s=get_global_id(0); if(s>=scount) return;
+ const uxx n=(uxx)scells[s]; uxx j[def_velocity_set]; neighbors(n, j);
+ float fhn[def_velocity_set]; load_f(n, fhn, fi, j, t);
+ double cx[def_velocity_set], cy[def_velocity_set], cz[def_velocity_set], wq[def_velocity_set], fl[def_velocity_set], pl[def_velocity_set];
+ vw_lex_tables(c, cx, cy, cz, wq);
+ for(uint k=0u; k<def_velocity_set; k++) { const int d=fx2lex[k]; fl[(uint)d]=wq[(uint)d]+(double)fhn[k]; }
+ const double3 F=(double3)((double)fx, (double)fy, (double)fz);
+ vw_rr27(fl, cx, cy, cz, wq, omega, F, pl);
+ double rho=0.0, jx=0.0, jy=0.0, jz=0.0;
+ for(uint d=0u; d<def_velocity_set; d++) { spost[def_velocity_set*s+d]=pl[d]; rho+=pl[d]; jx+=pl[d]*cx[d]; jy+=pl[d]*cy[d]; jz+=pl[d]*cz[d]; }
+ const double3 up=((double3)(jx, jy, jz)-0.5*F)/rho;
+ sfields[4u*s]=rho; vstore3(up, 0, sfields+4u*s+1u);
+}
+// Task 98: the wall pass of the frozen reference (t89_model.py WallReferenceModel27 + t95_model.py transport_augmented;
+// SPEC Section 4 steps 5-9): incoming I = G p + G_arm L p + s; sample rho_s = S rho_p, u_s = P S u_p (friction); the
+// wall-extrapolated even reference rho_w = rho_s - 1/2 n.S[L rho_p], u_w = P[S u_p - 1/2 S[L u_p] n]; ret = v B(rho_w, u_w) - I
+// - K rho_s phi.u_s; ONE delta per facet over all rows; Q = ret + v delta; J = sum c (Q + I); the prism mean ebar of the
+// feq3-Taylor shape. rho_w non-finite or <= 0 increments wfail (no clamp; the run is invalid). Captures rho_w, u_w and delta.
+kernel void vw_wall_rr27(const uint facets, const double K, const global int* c, const global uint* fo, const global uint* rd, const global double* vi, const global double* normals,
+ const global uint* so, const global uint* si, const global double* sw, const global uint* sgrad, const global uint* go, const global uint* gi, const global double* gw,
+ const global double* post, const global double* fields, const global double* s, global double* incoming, global double* Q, global double* impulse, const global double* phi,
+ const global double* garm, const global uint* gdon, const global double* grad, global double* ebar, global double* wstate, global double* delta_out, global uint* wfail) {
+ const uint a=get_global_id(0); if(a>=facets) return;
+ const uint NF3=3u*(def_velocity_set+4u);
+ const double3 nrm=vload3(a, normals);
+ double rho_s=0.0, drho=0.0; double3 uf=(double3)(0.0), du=(double3)(0.0);
+ for(uint z=so[a]; z<so[a+1u]; z++) {
+  const uint b=si[z]; const global double* gs=grad+NF3*sgrad[z];
+  rho_s+=sw[z]*fields[4u*b]; uf+=sw[z]*vload3(0, fields+4u*b+1u);
+  drho+=sw[z]*dot(nrm, vload3(def_velocity_set, gs));
+  du+=sw[z]*(double3)(dot(nrm, vload3(def_velocity_set+1u, gs)), dot(nrm, vload3(def_velocity_set+2u, gs)), dot(nrm, vload3(def_velocity_set+3u, gs)));
+ }
+ const double3 us=uf-nrm*dot(uf, nrm); // friction at the sample
+ const double rho_w=rho_s-0.5*drho;
+ double3 uw=uf-0.5*du; uw-=nrm*dot(uw, nrm); // the even reference
+ if(!(vw_finite(rho_w)&&rho_w>0.0&&vw_finite(uw.x)&&vw_finite(uw.y)&&vw_finite(uw.z))) atomic_inc(wfail);
+ const double uw2=dot(uw, uw);
+ double inc[def_velocity_set], ret[def_velocity_set]; double denom=0.0, difference=0.0;
+ const uint begin=fo[a], end=fo[a+1u];
+ for(uint row=begin; row<end; row++) {
+  const uint k=row-begin; const int i=(int)rd[row]; const double3 ci=convert_double3(vload3(i, c)); const double w=vw_weight(i, c);
+  double sum=0.0;
+  for(uint z=go[row]; z<go[row+1u]; z++) { const uint st=gi[z]; sum+=gw[z]*(post[st]+dot(vload3(z, garm), vload3(st%def_velocity_set, grad+NF3*gdon[z]))); }
+  sum+=s[row]; // the pending arrivals, consumed once
+  inc[k]=sum; incoming[row]=sum;
+  const double cuw=dot(ci, uw);
+  const double even=2.0*w*rho_w*(1.0+4.5*cuw*cuw-1.5*uw2);
+  ret[k]=vi[row]*even-sum-K*rho_s*dot(vload3(row, phi), us);
+  denom+=vi[row]; difference+=sum-ret[k];
+  double he=0.0, H=0.0;
+  for(uint z=go[row]; z<go[row+1u]; z++) { const uint b=gi[z]/def_velocity_set; he+=gw[z]*vw_affine_e(i, c, fields[4u*b], vload3(0, fields+4u*b+1u), vload3(z, garm), grad+NF3*gdon[z]); H+=gw[z]; }
+  ebar[row]=he/H;
+ }
+ const double delta=difference/denom; double3 J=(double3)(0.0);
+ for(uint row=begin; row<end; row++) {
+  const uint k=row-begin; const double3 ci=convert_double3(vload3((int)rd[row], c));
+  const double v=ret[k]+vi[row]*delta; Q[row]=v; J+=(v+inc[k])*ci;
+ }
+ vstore3(J, a, impulse);
+ wstate[4u*a]=rho_w; vstore3(uw, 0, wstate+4u*a+1u); delta_out[a]=delta;
+}
+)+"#endif"+R( // VOLUMETRIC_WALL_RR27
+)+"#endif"+R( // VOLUMETRIC_WALL
 )+"#ifdef SURFACE"+R(
 )+R(void load_f_outgoing(const uxx n, float* fon, const global fpxx* fi, const uxx* j, const ulong t) { // load outgoing DDFs, even: 1:1 like stream-out odd, odd: 1:1 like stream-out even
 	for(uint i=1u; i<def_velocity_set; i+=2u) { // Esoteric-Pull
@@ -1522,6 +1894,12 @@ string opencl_c_container() { return R( // ########################## begin of O
 
 
 )+R(kernel void stream_collide)+"("+R(global fpxx* fi, global float* rho, global float* u, global uchar* flags, const ulong t, const float fx, const float fy, const float fz // ) { // main LBM kernel
+)+"#ifdef VOLUMETRIC_WALL"+R(
+	, global uint* vw_clamp // native clamp activation counter (task 19): any activation invalidates a physical comparison
+)+"#endif"+R(
+)+"#ifdef VOLUMETRIC_WALL_FP64_COLLISION"+R(
+	, const double vw_omega64 // task 57: the FP64 relaxation rate of the ordinary cells: the container's omega = 1/(3 nu + 1/2), the same double as vw_collide (before an attachment: 1/(3 nu + 1/2) of the LBM nu)
+)+"#endif"+R(
 )+"#ifdef FORCE_FIELD"+R(
 	, const global float* F // argument order is important
 )+"#endif"+R( // FORCE_FIELD
@@ -1546,6 +1924,9 @@ string opencl_c_container() { return R( // ########################## begin of O
 	const uchar flagsn = flags[n]; // cache flags[n] for multiple readings
 	const uchar flagsn_bo=flagsn&TYPE_BO, flagsn_su=flagsn&TYPE_SU; // extract boundary and surface flags
 	if(flagsn_bo==TYPE_S||flagsn_su==TYPE_G) return; // if cell is solid boundary or gas, just return
+)+"#ifdef VOLUMETRIC_WALL"+R(
+	if(flagsn&TYPE_V) return; // R cell: collided and streamed by the volumetric wall kernels, its address set is never touched here (task 19)
+)+"#endif"+R(
 
 	uxx j[def_velocity_set]; // neighbor indices
 	neighbors(n, j); // calculate neighbor indices
@@ -1680,6 +2061,13 @@ string opencl_c_container() { return R( // ########################## begin of O
 	}
 )+"#endif"+R( // TEMPERATURE
 
+)+"#ifdef VOLUMETRIC_WALL"+R(
+)+"#ifdef VOLUME_FORCE"+R( // task 43: the flag is taken from the force-shifted velocity (the argument of the clamp below), so a force-induced clamp is counted
+	const uint vw_clamped = (uint)(fabs(fma(fxn, 0.5f/rhon, uxn))>def_c)|(uint)(fabs(fma(fyn, 0.5f/rhon, uyn))>def_c)|(uint)(fabs(fma(fzn, 0.5f/rhon, uzn))>def_c);
+)+"#else"+R( // VOLUME_FORCE
+	const uint vw_clamped = (uint)(fabs(uxn)>def_c)|(uint)(fabs(uyn)>def_c)|(uint)(fabs(uzn)>def_c); // before the clamp below (task 19)
+)+"#endif"+R( // VOLUME_FORCE
+)+"#endif"+R(
 	{ // separate block to avoid variable name conflicts
 )+"#ifdef VOLUME_FORCE"+R( // apply force and collision operator, write to fi in video memory
 		const float rho2 = 0.5f/rhon; // apply external volume force (Guo forcing, Krueger p.233f)
@@ -1694,6 +2082,9 @@ string opencl_c_container() { return R( // ########################## begin of O
 		for(uint i=0u; i<def_velocity_set; i++) Fin[i] = 0.0f;
 )+"#endif"+R( // VOLUME_FORCE
 	}
+)+"#ifdef VOLUMETRIC_WALL"+R(
+	if(vw_clamped) atomic_inc(vw_clamp); // counted, never silent (task 19)
+)+"#endif"+R(
 
 )+"#ifdef UPDATE_FIELDS"+R(
 )+"#ifdef EQUILIBRIUM_BOUNDARIES"+R(
@@ -1788,7 +2179,78 @@ string opencl_c_container() { return R( // ########################## begin of O
 	for(uint i=0u; i<def_velocity_set; i++) Fin[i] *= c_tau;
 )+"#endif"+R( // VOLUME_FORCE
 )+"#ifndef EQUILIBRIUM_BOUNDARIES"+R(
+)+"#ifdef VOLUMETRIC_WALL_FP64_COLLISION"+R(
+)+"#ifdef VOLUMETRIC_WALL_RR27"+R(
+	{ // task 98: the RR collision of the ordinary cell in FP64 (vw_rr27, FluidX3D direction order), f = w + g with the double weights of vw_weight; no velocity clamp (the clamp count above stays a counted, never silent, indicator); the stored g = convert_float_rte(p - w)
+		double fd[def_velocity_set], pd[def_velocity_set], cdx[def_velocity_set], cdy[def_velocity_set], cdz[def_velocity_set], wd[def_velocity_set];
+		for(uint i=0u; i<def_velocity_set; i++) {
+			cdx[i] = (double)c(i); cdy[i] = (double)c(def_velocity_set+i); cdz[i] = (double)c(2u*def_velocity_set+i);
+			const int si = (int)(cdx[i]*cdx[i]+cdy[i]*cdy[i]+cdz[i]*cdz[i]);
+			wd[i] = si==0 ? 8.0/27.0 : (si==1 ? 2.0/27.0 : (si==2 ? 1.0/54.0 : 1.0/216.0));
+			fd[i] = wd[i]+(double)fhn[i];
+		}
+)+"#ifdef VOLUME_FORCE"+R(
+		const double3 Fd = (double3)((double)fxn, (double)fyn, (double)fzn);
+)+"#else"+R( // VOLUME_FORCE
+		const double3 Fd = (double3)(0.0);
+)+"#endif"+R( // VOLUME_FORCE
+		vw_rr27(fd, cdx, cdy, cdz, wd, vw_omega64, Fd, pd);
+)+"#ifdef UPDATE_FIELDS"+R(
+		{ // the level-t density and physical velocity (j + F/2)/rho of the field arrays
+			double rd=0.0, jdx=0.0, jdy=0.0, jdz=0.0;
+			for(uint i=0u; i<def_velocity_set; i++) { rd += fd[i]; jdx += fd[i]*cdx[i]; jdy += fd[i]*cdy[i]; jdz += fd[i]*cdz[i]; }
+			rho[n] = (float)rd;
+			store3(u, n, (float3)((float)((jdx+0.5*Fd.x)/rd), (float)((jdy+0.5*Fd.y)/rd), (float)((jdz+0.5*Fd.z)/rd)));
+		}
+)+"#endif"+R( // UPDATE_FIELDS
+		for(uint i=0u; i<def_velocity_set; i++) fhn[i] = convert_float_rte(pd[i]-wd[i]); // the stored shifted population, rounded to nearest
+	}
+)+"#else"+R( // VOLUMETRIC_WALL_RR27
+	{ // task 57: the collision of the ordinary cell in FP64, the formula of vw_collide (physical populations f = w + g, exact-in-double weights, u = (j + F/2)/rho, Guo source); only the stored result is rounded to FP32. The float values above stay for the fields and the clamp count.
+		double fd[def_velocity_set]; double rd=0.0, jdx=0.0, jdy=0.0, jdz=0.0;
+		for(uint i=0u; i<def_velocity_set; i++) {
+			const double wi = i==0u ? 1.0/3.0 : (i<7u ? 1.0/18.0 : 1.0/36.0);
+			fd[i] = wi+(double)fhn[i]; rd += fd[i];
+			jdx += fd[i]*(double)c(i); jdy += fd[i]*(double)c(def_velocity_set+i); jdz += fd[i]*(double)c(2u*def_velocity_set+i);
+		}
+)+"#ifdef VOLUME_FORCE"+R(
+		const double Fdx=(double)fxn, Fdy=(double)fyn, Fdz=(double)fzn;
+		const double udx=clamp((jdx+0.5*Fdx)/rd, -(double)def_c, (double)def_c), udy=clamp((jdy+0.5*Fdy)/rd, -(double)def_c, (double)def_c), udz=clamp((jdz+0.5*Fdz)/rd, -(double)def_c, (double)def_c);
+		const double uFd = udx*Fdx+udy*Fdy+udz*Fdz;
+)+"#else"+R( // VOLUME_FORCE
+		const double udx=clamp(jdx/rd, -(double)def_c, (double)def_c), udy=clamp(jdy/rd, -(double)def_c, (double)def_c), udz=clamp(jdz/rd, -(double)def_c, (double)def_c);
+)+"#endif"+R( // VOLUME_FORCE
+		const double u2d = udx*udx+udy*udy+udz*udz;
+)+"#ifdef SUBGRID"+R( // the Smagorinsky closure of vw_collide in FP64, with the rate of the ordinary cells
+		double Hdxx=0.0, Hdyy=0.0, Hdzz=0.0, Hdxy=0.0, Hdxz=0.0, Hdyz=0.0;
+		for(uint i=0u; i<def_velocity_set; i++) {
+			const double wi = i==0u ? 1.0/3.0 : (i<7u ? 1.0/18.0 : 1.0/36.0);
+			const double cdx=(double)c(i), cdy=(double)c(def_velocity_set+i), cdz=(double)c(2u*def_velocity_set+i); const double cud = cdx*udx+cdy*udy+cdz*udz;
+			const double fneqd = fd[i]-wi*rd*(1.0+3.0*cud+4.5*cud*cud-1.5*u2d);
+			Hdxx += cdx*cdx*fneqd; Hdyy += cdy*cdy*fneqd; Hdzz += cdz*cdz*fneqd; Hdxy += cdx*cdy*fneqd; Hdxz += cdx*cdz*fneqd; Hdyz += cdy*cdz*fneqd;
+		}
+		const double Qd = Hdxx*Hdxx+Hdyy*Hdyy+Hdzz*Hdzz+2.0*(Hdxy*Hdxy+Hdxz*Hdxz+Hdyz*Hdyz); const double tau0d = 1.0/vw_omega64;
+		const double wd = 2.0/(tau0d+sqrt(tau0d*tau0d+(double)0.76421222f*sqrt(Qd)/rd));
+)+"#else"+R( // SUBGRID
+		const double wd = vw_omega64; // the same double rate as the wall cells (scientist #1240 b); the FP32 path keeps its float literal def_w
+)+"#endif"+R( // SUBGRID
+		for(uint i=0u; i<def_velocity_set; i++) {
+			const double wi = i==0u ? 1.0/3.0 : (i<7u ? 1.0/18.0 : 1.0/36.0);
+			const double cdx=(double)c(i), cdy=(double)c(def_velocity_set+i), cdz=(double)c(2u*def_velocity_set+i); const double cud = cdx*udx+cdy*udy+cdz*udz;
+			const double feqd = wi*rd*(1.0+3.0*cud+4.5*cud*cud-1.5*u2d);
+)+"#ifdef VOLUME_FORCE"+R(
+			const double cFd = cdx*Fdx+cdy*Fdy+cdz*Fdz;
+			const double vd = fd[i]-wd*(fd[i]-feqd)+(1.0-0.5*wd)*wi*(3.0*(cFd-uFd)+9.0*cud*cFd);
+)+"#else"+R( // VOLUME_FORCE
+			const double vd = fd[i]-wd*(fd[i]-feqd);
+)+"#endif"+R( // VOLUME_FORCE
+			fhn[i] = convert_float_rte(vd-wi); // the stored shifted population, rounded to nearest
+		}
+	}
+)+"#endif"+R( // VOLUMETRIC_WALL_RR27
+)+"#else"+R( // VOLUMETRIC_WALL_FP64_COLLISION
 	for(uint i=0u; i<def_velocity_set; i++) fhn[i] = fma(1.0f-w, fhn[i], fma(w, feq[i], Fin[i])); // perform collision (SRT)
+)+"#endif"+R( // VOLUMETRIC_WALL_FP64_COLLISION
 )+"#else"+R( // EQUILIBRIUM_BOUNDARIES
 	for(uint i=0u; i<def_velocity_set; i++) fhn[i] = flagsn_bo==TYPE_E ? feq[i] : fma(1.0f-w, fhn[i], fma(w, feq[i], Fin[i])); // perform collision (SRT)
 )+"#endif"+R( // EQUILIBRIUM_BOUNDARIES

@@ -65,3 +65,17 @@ message(STATUS "Using bundled:   ${BUNDLED_LIBS}")
 message(STATUS "Tests:           ${FLUIDX3D_BUILD_TESTS}")
 message(STATUS "Warnings=errors: ${FLUIDX3D_WERROR}")
 message(STATUS "===========================================")
+
+# The host library of the native volumetric slip wall (the VWNAT01 container reader and checks; no OpenCL), its container
+# checker and its unit tests. The wall itself is the setup extension VOLUMETRIC_WALL (examples/volumetric_wall,
+# research/slip_wall/README.md); it is always compiled into the core, this option only adds the tools and tests.
+option(FLUIDX3D_EXPERIMENTAL_VOLUMETRIC_WALL "Build the GPU-free container library, the container checker and the unit tests of the native volumetric slip wall" OFF)
+if(FLUIDX3D_EXPERIMENTAL_VOLUMETRIC_WALL)
+    add_library(fluidx3d_volumetric_wall_native STATIC src/experimental/volumetric_wall_native.cpp)
+    target_include_directories(fluidx3d_volumetric_wall_native PUBLIC src)
+    target_link_libraries(fluidx3d_volumetric_wall_native PUBLIC fluidx3d::build_options)
+    set_target_properties(fluidx3d_volumetric_wall_native PROPERTIES FLUIDX3D_PRECISE_FLOAT ON)
+    add_executable(volumetric_wall_native_check tests/physics/volumetric_wall_native_check.cpp)
+    target_link_libraries(volumetric_wall_native_check PRIVATE fluidx3d_volumetric_wall_native)
+    set_target_properties(volumetric_wall_native_check PROPERTIES FLUIDX3D_PRECISE_FLOAT ON RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/bin")
+endif()

@@ -9,6 +9,7 @@ set(FLUIDX3D_CORE_SOURCES
     ${FLUIDX3D_SRC_DIR}/lbm.cpp
     ${FLUIDX3D_SRC_DIR}/main.cpp
     ${FLUIDX3D_SRC_DIR}/shapes.cpp
+    ${FLUIDX3D_SRC_DIR}/experimental/volumetric_wall_native.cpp # task 19: no dependency on defines.hpp; used only with VOLUMETRIC_WALL
 )
 # The Setup API's sources are in the library fluidx3d::setup (lib/setup); its headers that use the LBM
 # are compiled with each example's main.cpp.
