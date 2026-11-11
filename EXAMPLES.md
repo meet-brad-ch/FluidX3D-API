@@ -11,6 +11,7 @@ the Setup API ([README.md](README.md#setup-api)); its extensions are named in it
 | **taylor_green_3d** | INTERACTIVE_GRAPHICS | - |
 | **taylor_green_2d** | D2Q9, INTERACTIVE_GRAPHICS | - |
 | **poiseuille_flow** | VOLUME_FORCE | - |
+| **volumetric_wall** (targets volumetric_wall_rr27, volumetric_wall_noslip, *_visual, and the earlier D3Q19 volumetric_wall) | D3Q27, VOLUMETRIC_WALL, VOLUMETRIC_WALL_FP64_COLLISION, VOLUMETRIC_WALL_RR27, VOLUME_FORCE (the baseline: D3Q27, VOLUME_FORCE) | the ready container examples/volumetric_wall/L24_r12_d3q27.vwnat, or a VWNAT01 container from scripts/slip_wall/terrain_container.py |
 | **stokes_drag** | FORCE_FIELD, EQUILIBRIUM_BOUNDARIES | - |
 | **cylinder_duct** | VOLUME_FORCE, INTERACTIVE_GRAPHICS | - |
 | **taylor_couette** | MOVING_BOUNDARIES, INTERACTIVE_GRAPHICS | - |

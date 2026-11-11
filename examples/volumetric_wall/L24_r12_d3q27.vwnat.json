@@ -1,0 +1,20 @@
+{
+ "container": "examples/volumetric_wall/L24_r12_d3q27.vwnat",
+ "sha256": "9af23bbace3ca097feb0b71645ce49221112ced6eab73417825fe09c2b535edd",
+ "bytes": 20629360,
+ "input": {"file": "examples/volumetric_wall/L24_heights_r12.csv", "sha256": "660b5646d5caf72a9c70830024f9edaeb2a2a1da4674ca011b72031ed11cf11c",
+           "rule": "repr(round(3.5 + cos(2 pi i/24) cos(2 pi j/24), 12)), scripts/slip_wall/PROVENANCE.md"},
+ "command": "python scripts/slip_wall/terrain_container.py --heights examples/volumetric_wall/L24_heights_r12.csv --z-top 16 --nu 0.1 --friction 0.06 --velocities D3Q27 --out L24_r12_d3q27.vwnat",
+ "builder": {"terrain_container.py": "fd4fc4595fec9da1461c38e40445b4a490d863b771c48a8f2dc78a824f5734f2",
+             "builder3d.py": "d7cb46a24f8e3ce92fbfb89090e694060a4366f36bba3195b29f731da1f6ba54",
+             "python": "3.10.11", "numpy": "2.2.6", "scipy": "1.15.3"},
+ "geometry": {"velocity_set": "D3Q27", "box": [24, 24, 16], "z_lo": 1, "cells": 7536, "facets": 1920, "rows": 22446, "W_nnz": 408,
+              "nu": 0.1, "friction_K": 0.06, "initial_state": "rest"},
+ "native_identities": {"tolerance": 1e-10, "donor_partition": 1.229551701154971e-12, "receiver_coverage": 3.6217695509321857e-12,
+                       "prism_coverage": 8.660092860513754e-12, "return_delivery": 8.659961636681146e-12},
+ "native_checker": {"result": "PASS", "exit_code": 0, "cells": 7536, "cut": 672, "owned": 178713},
+ "build_wall_seconds": 307.7,
+ "build_memory": "sum of per-process peak working sets 365461504 bytes (not a simultaneous peak; 0.2 s polling)",
+ "record": "research tree (branch volumetric-wall-model): collaboration/task103_artifacts/run, commit 9116af03 (task 103, E1, PASS); accepted by the scientist",
+ "not_verified_here": "the example runs, the visual comparison and the cost measurement on this container"
+}

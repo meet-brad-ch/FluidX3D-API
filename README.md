@@ -25,6 +25,9 @@ and a model for atmospheric convection. The lattice Boltzmann core is the core o
 - **Atmospheric convection.** A thermal model for the convective boundary layer: the fix of the `alpha / 2`
   diffusivity, a surface heat flux, eddy heat diffusivity, wind nudging, a sponge layer and moisture with condensation.
   Heat and water can move by conservative finite volumes, driven by the link mass fluxes of the LBM.
+- **A volumetric slip wall on terrain (experimental).** An opt-in D3Q27 cut-cell wall for static triangulated terrain,
+  with a sampled linear slip law, RR collision in FP64 and FP32 storage. Off by default; see
+  [research/slip_wall/README.md](research/slip_wall/README.md) for the supported scope and the validation status.
 - **A voxelization fix.** Ray jitter removes the vertical slice artifacts of mesh voxelization.
 - **Python modules.** FluidX3D applications as Python extension modules (nanobind), also from outside the repository.
 
@@ -38,6 +41,7 @@ and a model for atmospheric convection. The lattice Boltzmann core is the core o
 | [SETUP_API.md](SETUP_API.md) | How to write a simulation with the Setup API |
 | [lib/setup/README.md](lib/setup/README.md) | The layout, the conventions and the tests of the Setup API (`ctest -L "unit\|physics"`) |
 | [research/convection/README.md](research/convection/README.md) | Atmospheric convection: the features, how to use them, their limits, the validation, the references |
+| [research/slip_wall/README.md](research/slip_wall/README.md) | The volumetric slip wall on terrain (experimental): build, use, refusals, restart, limits, validation |
 | [FORK_CHANGES.md](FORK_CHANGES.md) | Each change of FluidX3D-API, with its measurement |
 | [upstream_issues.md](upstream_issues.md) | Problems found in FluidX3D, to report to the original project |
 | [CHANGELOG.md](CHANGELOG.md) | The changes in each release |

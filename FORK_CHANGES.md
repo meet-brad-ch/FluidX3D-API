@@ -28,6 +28,7 @@ the measurement that supports it. How to use the features, their limits and the 
 
 | Extension / API | What it does | Its test |
 |---|---|---|
+| `VOLUMETRIC_WALL` + `VOLUMETRIC_WALL_RR27`, `LBM::set_volumetric_wall()` (experimental) | A D3Q27 cut-cell slip wall on static terrain: RR collision with the full force term in every cell (FP64), the wall-extrapolated even return, a sampled linear slip law (traction -rho (K/3) u_t on the fluid), one mass correction per facet, delayed transfer between facets; FP32 storage. Off by default; unsupported options refused; invalid wall states reported at the end of `run()`. See research/slip_wall/README.md. | `fluidx3d_volumetric_wall_native_tests`, `physics_volumetric_wall_native_rr27` (acceptance driver) |
 | `THERMAL_DIFFUSIVITY_FIX` | Makes `alpha` the diffusivity. | `thermal_diffusivity`, `thermal_diffusivity_fix` |
 | `TYPE_Y` heat source, `TYPE_X` as a 4x marker, `LBM::set_heat_rate()` | Adds a heated layer or patch as a flux boundary, in place of a fixed temperature. | `heat_source` |
 | `LBM::set_inv_prandtl_t()` with `SUBGRID` | Lets the Smagorinsky eddy viscosity mix heat (and water) too, at `Pr_t`. | `eddy_heat_diffusivity` |

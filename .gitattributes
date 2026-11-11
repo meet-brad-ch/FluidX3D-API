@@ -4,3 +4,5 @@ src/lodepng.* linguist-vendored
 src/kernel.cpp linguist-language=OpenCL
 src/setup.cpp linguist-documentation
 scripts/*.sh text eol=lf
+examples/volumetric_wall/*.csv -text
+examples/volumetric_wall/*.vwnat binary
