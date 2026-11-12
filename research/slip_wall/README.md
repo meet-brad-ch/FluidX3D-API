@@ -10,6 +10,18 @@ what the engine supports, and what it does not support.
 > contract, not general terrain accuracy. The engine of this product passed its core acceptance
 > (V1_PRODUCT_CORE_ACCEPTANCE_2026-11-10.md), and the ready example passed its checks: equivalence with the acceptance
 > driver, finite outputs, the visual pair and one cost measurement (see Validation and Example results).
+>
+> **V2 (2026-11-11), opt-in:** a static Smagorinsky subgrid rate (`VOLUMETRIC_WALL_SGS`), a facetwise rough wall law
+> (`VOLUMETRIC_WALL_ROUGH`), an open x axis with a hard or relaxed inlet and a characteristic outlet (`VOLUMETRIC_WALL_OPEN_X`), and an
+> actual-hill example. See "V2: SGS, rough wall, open x and the hill example". **Hill flow status (2026-11-11): the extended-hill run PASSED its registered gates (task 129), and the scientist accepted it for ONE declared regime:** the 160 x 64 x 25 box, rest start,
+> length-scaled inlet startup (K_u = 1/1580), open x with an outflow-only outlet, 16000 updates, nu 0.0006, U 0.05, with the SGS, rough wall, T119 and SRD options.
+> Earlier runs did not pass, and they are the reason for the declared startup and the extended box: the uniform start (positivity at update 1, HF-01); the 80-wide box
+> (outlet sign check at updates 110 and 5560, the wake reached the outlet); the first run on the 160-wide box with the 780-update ramp (density screen at update 625).
+> **Limits:** this is a bounded validation of one numerical demonstration. It is not domain independence, not an atmospheric prediction, and not a statement about any other terrain, box or inlet.
+> The outlet is outflow-only: a wake that reaches it can end a run with exit code 1 (in the accepted run the wake front was at least 34 cells upstream of the outlet at each of the saved checkpoints that were examined, 780 to 16000; this was observed at those checkpoints, not continuously).
+> Record: research tree, `research/wall_model/v2/hill_demo/` (the task 125 to 129 protocols and results). The demo targets reproduced the final raw state of the accepted run byte for byte.
+> **The no-slip baseline is a different setup (voxel bounce-back, FP32 SRT, fixed-equilibrium inlet at the full speed), not an isolated slip-only comparison.**
+> The hill launch recipe below is the recipe of the accepted run.
 
 ## What the feature does
 
@@ -22,8 +34,9 @@ what the engine supports, and what it does not support.
 | Transfer between facets | Fluid that leaves one facet and reaches another facet within one step is held as a pending amount and arrives one step later. The total of fluid plus pending mass is conserved. |
 | Storage | Populations in FP32 (FluidX3D's shifted storage `g = f - w`); pending amounts and all wall arithmetic in FP64. |
 
-The slip law is a prescribed linear coefficient. It is **not** a rough-wall or log-law closure. The feature makes no claim
-for atmospheric boundary layers, turbulence models (SGS) or stratification.
+In V1 the slip law is a prescribed linear coefficient: not a rough-wall or log-law closure, and no subgrid model. V2 adds
+both as opt-in macros (see the V2 section). The feature makes no claim for atmospheric boundary layers, turbulence
+prediction or stratification.
 
 ## How to build
 
@@ -142,6 +155,153 @@ live switching.
 populations and the pending amounts back (`volumetric_wall_write_fi`, `volumetric_wall_write_pending`) and set `t`
 (`volumetric_wall_set_time_step`). Never reset the pending amounts to zero.
 
+## V2: SGS, rough wall, open x and the hill example
+
+Each V2 part is a compile-time macro on top of `VOLUMETRIC_WALL_RR27`. Without the macro the code is the V1 code.
+
+| Macro | What it does | Input |
+|---|---|---|
+| `VOLUMETRIC_WALL_SGS` | A static Smagorinsky rate in the RR collision of every cell. `SUBGRID` stays refused. | `LBM::set_volumetric_wall_sgs(k)` before the attachment; example: `VOLUMETRIC_WALL_SGS_K`. `k = 0` is the V1 rate. The qualified value is `0x1.8746d2p-1`. |
+| `VOLUMETRIC_WALL_ROUGH` | A facetwise rough law `K_a = K0_a + 3 C_a |u_s,a|`, with `C = (0.4 / ln(0.5 / z0))^2` (sample distance 0.5). The lid stays free-slip. | The container sections `facet_friction` and `facet_kind`: builder option `--rough-z0 Z0` (and `--rough-K0`). A build without the macro refuses a container with these sections. |
+| `VOLUMETRIC_WALL_OPEN_X` | An open x axis. The cells at `x = 0` (inlet) and `x = Nx - 1` (outlet) hold the equilibrium of an FP64 boundary state, which a characteristic (LODI) update advances. Hard or relaxed inlet; outlet relaxation `K_p = sigma (1 - Ma^2) c / L_x`. y stays periodic. | `LBM::set_volumetric_wall_open_x(VolumetricWallOpenX)` before the attachment; example: `VOLUMETRIC_WALL_OPEN=x` and the `VOLUMETRIC_WALL_INLET_*` and `_OUTLET_*` inputs (`examples/volumetric_wall/main.cpp`). |
+
+What open x supports and refuses:
+
+- Supported: one uniform inlet velocity with `0 < u_x < c` (`c = 1/sqrt(3)`), positive subsonic outflow, zero force.
+- The length `L_x` of `K_p` is the cut length `Nx - 2` by default (the interior between the two boundary planes). For the
+  80-wide hill it is 78; the box length is 80. The input `VOLUMETRIC_WALL_OUTLET_LENGTH` is not forced to `Nx - 2`: the extended 160-wide hill sets it to 78 on purpose, as a fixed relaxation reference length, so that `K_p` keeps its value.
+- Refused at setup: an inlet with `u_x <= 0` or `u_x >= c`, a nonzero force, the open input in a closed build, an open build
+  without the open input.
+- Refused at run time (refusal 7.6, on the current and on the new boundary state): backflow at the outlet, inflow with the
+  wrong sign, `|u_n| >= c`, `rho <= 0`, a value that is not finite. The example then stops with exit code 1; the run is
+  invalid.
+- Not supported: backflow, forcing with the open axis, an inlet profile, more than one domain, open y or z.
+
+### The actual-hill example
+
+| Item | Value |
+|---|---|
+| Terrain | `resources/hill.stl` (4 x 4 km, 702 m high) on a 64 x 64 node grid, 62.5 m per cell, with 8 flat apron columns at each x end: `examples/volumetric_wall/hill_64_apron8_heights.csv` (80 x 64 nodes, SHA-256 d60b6677...). The height in cells is `1 + h / 62.5`, rounded to 2^-10 cell (largest change 3.1 cm). Lattice x = STL +y (the wind direction of `examples/hill`); lattice y = -STL x. The highest node is 12.10 cells (694 m; the 62.5 m sampling lowers the 702 m peak). |
+| Box | 80 x 64 x 24 (`--z-top 24`), free-slip lid; the extended hill adds 80 flat columns downstream (160 x 64 x 25, see below). Slopes up to 3.35 (73 degrees); 356 triangles are steeper than 3/2. |
+| Parameters | `nu = 0.0006`, inlet `U = 0.05` (relaxed ramp from rest in the accepted run), outlet `sigma = 0.58`, `F = 0`, SGS `k = 0x1.8746d2p-1`, rough `z0 = 0.01563151457179204` (`C = 0.013324`). |
+| Meaning | A reduced-Re numerical demonstration on a hill (`Re = U H / nu`, about 930 with the hill height in cells). It is not air at 10 km/h over 702 m, and not a validated prediction of atmospheric turbulence. The terrain is static and neutral (no heat). |
+
+**Steep terrain.** By default the builder refuses slopes of 1 or more (R11). `--allow-steep` skips only that check (R10 and R1
+stay) and records `"allow_steep": true` in the build report. Wall-return accuracy on facets steeper than 45 degrees is not
+qualified. The steep geometry checks S8 and S8X (S8X up to slope 3.75) qualify the builder's geometry on their own bounded
+inputs only. They are not a guarantee for every terrain with such slopes; each container still passes the builder's map
+identity gate.
+
+**Setup cost.** The container build runs on the CPU in Python. Every piece volume is exact (integer determinants, one
+rounding), and `--workers N` runs the producer and donor passes on N processes; the container is the same, byte for byte, as
+with one process (the worker count is only in the build report). Each worker holds its own copy of the cell geometry, so
+the memory grows with N. The registered build of this input with the final builder and 20 workers took 603.4 s, with a peak of
+15.7 GB (the sum over the process tree; record V2-HB-05, research tree). It is not a speed comparison with the earlier
+builder: the arithmetic changed as well. The container is not shipped. Build it once:
+
+    python scripts/slip_wall/terrain_container.py --heights examples/volumetric_wall/hill_64_apron8_heights.csv --z-top 24 --nu 0.0006 --friction 0 --rough-z0 "0.01563151457179204" --allow-steep --name hill --workers 20 --out hill_d3q27.vwnat
+
+`--initial-velocity 0.05,0,0` (an option of the builder) would write the uniform start `f0 = feq3(1, (0.05, 0, 0))` in every cell. That start is the registered hill flow test HF-01, which did NOT PASS (see the status at the top): with
+this start, a population became negative at update 1. The recipe below does not use it: its container starts at rest and the inlet ramps up. The example takes its start from the container in both modes.
+
+The example does NOT check that every population stays positive or that the density stays inside 5 % of rho_inf. Its run-time checks are the open-boundary refusals 7.6 and the engine's invalid
+wall-state and clamp counts at the end of `run()`. The commands below are the recipe of the accepted run (see the status at the top for its scope).
+
+When a map identity fails, the builder writes `hill_d3q27.vwnat.rejected.json`, no container, and exits with code 3.
+
+**The extended hill: the recipe of the accepted run (see the status at the top for its scope).** The order of the commands below is: geometry container, hill tables (the final container), configure and build, environment, run. Each command uses the file the previous one wrote: `hill_ext_d3q27.vwnat`, then `prep_hill\hill_final.vwnat`, then the output folders `out_hill_wall` and `out_hill_noslip`. The outlet of the 80-wide box was only 12 cells (1.1 hill heights) behind the last
+raised terrain column, and the wake reached it. The extension keeps the hill, the resolution, the inlet, the viscosity, the roughness and the wall, and appends 80 flat columns
+(height exactly 1) at the downstream end: `examples/volumetric_wall/hill_64_apron8_ext80_heights.csv` (160 x 64 nodes, SHA-256 8fb6d1fd...), box 160 x 64 x 25, 92 cells (8.28 hill heights, the
+hill height being 11.1045 cells above the ground plane) between the last raised column and the outlet. This is one extension; it does not show that the result is independent of the domain.
+
+Preparation of the container (rest start, no `--initial-velocity`). The registered container was built with the research-tree driver and the parallel builder
+(`ports/20261112_v2_geom_par`, `builder3d.py` SHA-256 58cff4cd..., `terrain_container.py` 4f6d9ad9...). The shipped builder below (`terrain_container.py` SHA-256 8ae24321..., with the `--allow-steep` option instead of the driver)
+was run independently from a clean export with the quoted roughness below: it reproduced the registered geometry container byte for byte (SHA-256 a0a1d18c...). A run with the unquoted roughness differed only in provenance and in 23244 terrain
+friction coefficients (see the note after the command).
+
+    python scripts/slip_wall/terrain_container.py --heights examples/volumetric_wall/hill_64_apron8_ext80_heights.csv --z-top 24 --nu 0.0006 --friction 0 --rough-z0 "0.01563151457179204" --allow-steep --name hill --workers 20 --out hill_ext_d3q27.vwnat
+
+Write the roughness as a quoted string, as shown. PowerShell turns an unquoted `0.01563151457179204` into the double `0.015631514571792` (15 significant digits), which changes the 23244 terrain friction
+coefficients by up to 2.3e-17; the quoted string keeps all 17 digits. `--name hill` is the name of the terrain in the container, and the builder does not append `.vwnat`: give the full output file name.
+
+The registered geometry container `hill_d3q27.vwnat` has SHA-256 a0a1d18c1745c5c4d5e7d498a9817b2494ba4f62320020d94b136d8ecb2f3792 (230849 cells, 33484 facets, 324472 rows). The two
+sections `t119_gdelta`, `t119_wmoment` (the whole-prism correction) and the 18 sections `t121_*` (the state redistribution) are added by `scripts/slip_wall/hill_tables/prepare_hill_container.py`. It runs the
+qualified tools of the research tree, which are shipped verbatim in `scripts/slip_wall/hill_tables/tree/` (22 files, listed with their sha256 in `MANIFEST.sha256`), in four stages with explicit inputs; it needs
+Python with numpy and scipy, and the companion extraction uses 20 worker processes. No algorithm is changed (see the header of the script for the few pinned constants it replaces in a copy).
+
+    python scripts/slip_wall/hill_tables/prepare_hill_container.py --heights examples/volumetric_wall/hill_64_apron8_ext80_heights.csv --geometry hill_ext_d3q27.vwnat --workdir prep_hill --workers 20
+
+The final container is `prep_hill/hill_final.vwnat`; the registered one has SHA-256 2acd5121ddd696101aa78c4e65d628c35661d9adf539877e016521d01520835a (the script reports whether yours equals it). The wall demo targets
+(`volumetric_wall_rr27_sgs_rough_open_visual` and `_live`) are built with `VOLUMETRIC_WALL_T119` and `VOLUMETRIC_WALL_SRD`, and refuse any container without these sections.
+
+    tools\configure.bat Release Ninja -- -DFLUIDX3D_EXPERIMENTAL_VOLUMETRIC_WALL=ON
+    tools\build.bat volumetric_wall_rr27_sgs_rough_open_visual Release
+    tools\build.bat volumetric_wall_noslip_open_visual Release
+
+The `_visual` targets write frames (GRAPHICS). The `_live` targets (`volumetric_wall_rr27_sgs_rough_open_live`, `volumetric_wall_noslip_open_live`) open a window (INTERACTIVE_GRAPHICS; press P to
+start). Both modes read the same container and use the same terrain cells, inflow speed, viscosity, camera and colour scale (`GRAPHICS_U_MAX 0.14`: full colour at |u| = 0.081).
+`VOLUMETRIC_WALL_VIEW=hill` draws the terrain, velocity-coloured streamlines and the mode label. `VOLUMETRIC_WALL_VIEW_CENTER_X=40` centres the camera on the hill (the middle of the 80 columns the hill
+occupies), so the downstream part does not dominate the picture. The camera is a free camera inside the box below the lid, at the middle of the box width, 0.6 box widths upstream of the view centre and at 86 % of the box height. It looks along the flow (+x), 24 degrees down, with a field of view of 84 degrees, so the whole raised hill, the approach and the wake are in the picture. The streamlines are drawn at a sparser seed density (`GRAPHICS_STREAMLINE_SPARSE 10u`), and the three label lines have a plain background. Both modes use the same function and the same settings.
+
+The V2 wall (all values explicit; the startup is K_u = 1/1580, NOT the 1/780 of the 80-wide box):
+
+    $env:VOLUMETRIC_WALL_CONTAINER = "prep_hill\hill_final.vwnat"
+    $env:VOLUMETRIC_WALL_STEPS = "16000"
+    $env:VOLUMETRIC_WALL_SGS_K = "0x1.8746d2p-1"
+    $env:VOLUMETRIC_WALL_OPEN = "x"
+    $env:VOLUMETRIC_WALL_INLET_U = "0.05,0,0"
+    $env:VOLUMETRIC_WALL_INLET_MODE = "relaxed,0x1.4bd3edda68fe1p-11"
+    $env:VOLUMETRIC_WALL_OUTLET_SIGMA = "0x1.28f5c28f5c28fp-1"
+    $env:VOLUMETRIC_WALL_OUTLET_MACH = "0x1.62b9586ad0a21p-4"
+    $env:VOLUMETRIC_WALL_OUTLET_LENGTH = "0x1.38p+6"
+    $env:VOLUMETRIC_WALL_OUTLET_RHO_INF = "1"
+    $env:VOLUMETRIC_WALL_E_INITIAL = "1,0,0,0"
+    $env:VOLUMETRIC_WALL_VIEW = "hill"
+    $env:VOLUMETRIC_WALL_VIEW_CENTER_X = "40"
+    $env:VOLUMETRIC_WALL_FRAMES = "3160,8000,16000"
+    New-Item -ItemType Directory -Force out_hill_wall
+    $env:VOLUMETRIC_WALL_OUT = "out_hill_wall"; bin\volumetric_wall_rr27_sgs_rough_open_visual.exe
+
+`VOLUMETRIC_WALL_OUTLET_LENGTH` is the fixed relaxation reference length 78 (0x1.38p+6). It is NOT the length of the box: the default is `Nx - 2 = 158`, which would silently halve the outlet
+pressure relaxation `K_p = sigma (1 - Ma^2) c / L_x` from 0.0042609 to 0.0021. The accepted run keeps `K_p` at the value of the 80-wide box on purpose. The inlet ramp `u(t) = U (1 - (1 - K_u)^t)` has the time constant
+`T_u = 1/K_u = 1580` updates, which is the 780 of the 80-wide box scaled with the length (158 / 78). At update 16000 the inlet is at 99.996 % of the target, and the time integral of the prescribed inlet speed since the start is 721 cells (4.56 nominal lengths of 158); this is not measured particle travel.
+
+The no-slip voxel baseline, in the same shell, on the same container (it takes the cells and ignores the added T119 and SRD sections; this is checked at the recorded launch). It refuses the SGS, outlet and relaxed-inlet inputs, because it does not use them (its inlet is the fixed-equilibrium cell at the full inlet speed from the first step, with no ramp):
+
+    Remove-Item Env:VOLUMETRIC_WALL_SGS_K, Env:VOLUMETRIC_WALL_OUTLET_SIGMA, Env:VOLUMETRIC_WALL_OUTLET_MACH, Env:VOLUMETRIC_WALL_OUTLET_LENGTH, Env:VOLUMETRIC_WALL_OUTLET_RHO_INF, Env:VOLUMETRIC_WALL_E_INITIAL, Env:VOLUMETRIC_WALL_INLET_MODE
+    New-Item -ItemType Directory -Force out_hill_noslip
+    $env:VOLUMETRIC_WALL_OUT = "out_hill_noslip"; bin\volumetric_wall_noslip_open_visual.exe
+
+16000 steps are 5.06 transit times of the cut length (158 / 0.05 = 3160 steps each). A `_live` build refuses `VOLUMETRIC_WALL_FRAMES`.
+
+Live window (one window at a time; press P in the window to start). Build the `_live` target, set the same environment as above, and remove the frame list and the output folder, which a `_live` build refuses:
+
+    tools\build.bat volumetric_wall_rr27_sgs_rough_open_live Release
+    Remove-Item Env:VOLUMETRIC_WALL_FRAMES, Env:VOLUMETRIC_WALL_OUT, Env:VOLUMETRIC_WALL_STEPS -ErrorAction SilentlyContinue
+    bin\volumetric_wall_rr27_sgs_rough_open_live.exe
+
+For the no-slip baseline, build `volumetric_wall_noslip_open_live`, first remove the inputs that the baseline refuses (the list above, including `VOLUMETRIC_WALL_INLET_MODE`), and run `bin\volumetric_wall_noslip_open_live.exe`.
+
+**Measured cost (the research fixture, the same engine).** Container build: 1854 s with 20 workers (passes 1435 s, sampler 218 s, arms and gradient 52 s) for the extended hill; the memory figure of about 30 GB is the SUM of the per-process
+peaks of the worker processes, not a simultaneous peak. Companion extraction 593 s wall with 20 workers (445 s of extraction); state-redistribution tables 2 s, their check 14 s. GPU step of the wall build: 0.030 s per
+update in the 80 x 64 x 25 box and 0.042 s per update in the 160 x 64 x 25 box (the fixture's phase timers; the whole fixture run is slower, 0.2 s per update, because it also captures, hashes and writes diagnostics).
+The demo targets themselves (the recorded launch on a shared machine, single runs): the wall frame target took 74.5 s for 16000 updates with three frames and the E-state checks, and the no-slip baseline frame target took 3.4 s. These are single timings of one machine, not a benchmark.
+
+**The two modes differ in more than the wall law.** Their difference is NOT a wall-law-only experiment:
+
+| | V2 wall | No-slip voxel baseline |
+|---|---|---|
+| Geometry | cut cells of the exact terrain | the same cells as whole voxels (steps) |
+| Wall | volumetric slip return with the rough law, the whole-prism correction and the state redistribution; free-slip lid | bounce-back (no slip) on the terrain and on the lid |
+| Collision | FP64 RR27 with the static SGS `k` | FP32 SRT with FluidX3D's `SUBGRID` |
+| Inlet | relaxed LODI inlet state toward `u = (0.05, 0, 0)`, ramp time constant 1580 updates, from rest | `EQUILIBRIUM_BOUNDARIES` cells: rho 1, `u = (0.05, 0, 0)` at the full speed from the first step |
+| Outlet | characteristic relaxation to rho_inf (outflow-only; first-order outgoing difference), `K_p` fixed at the 80-wide value | `EQUILIBRIUM_BOUNDARIES` cells that hold rho 1 and the inlet velocity |
+
+The drawn terrain is the surface of the solid cells of the container (the cells without fluid), at cell resolution, and the same in both modes. It is not the exact cut surface of the wall build.
+
+**Scope.** A reduced-Re numerical demonstration on a hill. Not air at 10 km/h over 702 m, not a validated prediction of atmospheric turbulence, and not a claim of independence from the domain size. The outlet is outflow-only: a
+reversed flow at the outlet is refused (exit code 1). The flow must be checked at the recorded launch; the example does not check that the density stays inside 5 % of rho_inf.
+
 ## What the attachment refuses
 
 `set_volumetric_wall()` stops with a message when:
@@ -174,11 +334,12 @@ To find the step, run in shorter calls.
 | Limit | What it means |
 |---|---|
 | One GPU, one domain. | Multi-GPU is refused. |
-| Static, periodic geometry with a lid. | No inlet, outlet or moving wall. |
-| Uniform constant body force only. | Other forcing types are refused. |
-| Linear slip law with a constant `K`. | No rough-wall or log-law closure. |
-| No SGS. | `SUBGRID` is refused. |
-| Laminar, low-Mach flow. | The qualification covers laminar channel and terrain flows only. |
+| Static geometry with a lid; periodic in y, and in x unless `VOLUMETRIC_WALL_OPEN_X`. | No moving wall. Open x: hard or relaxed inlet with one uniform velocity, positive subsonic outflow; backflow is refused. |
+| Uniform constant body force only. | Other forcing types are refused. The open x build refuses a nonzero force. |
+| Linear slip law with a constant `K`, or (V2) the facetwise rough law. | The rough law is a sampled wall-function closure; it is not a validated atmospheric surface layer. |
+| SGS: only the static Smagorinsky rate of `VOLUMETRIC_WALL_SGS`. | `SUBGRID` is refused. |
+| Low-Mach flow. | V1 qualifies laminar channel and terrain flows; V2 qualifies its parts in the reference model (SGS, rough law, open boundary). The hill flow test with the uniform start did NOT PASS (positivity at update 1); the accepted hill run uses the rest start and the length-scaled startup, in one declared regime (see the status at the top). |
+| Slopes of 1 or more need `--allow-steep`. | Wall-return accuracy above 45 degrees is not qualified. The steep geometry checks (S8, S8X up to slope 3.75) cover their own inputs, not every steep terrain. |
 | The transfer between facets is delayed by one step. | It is not exact fractional-flight transport. The fluid-only mass changes by the pending exchange; fluid plus pending mass is conserved. |
 | Rows that are fully blocked, and directions that graze a facet, are not covered by the qualification fixtures. | Fully blocked rows are refused. Grazing directions have no row by construction. |
 | Containers come from an offline Python builder (`scripts/slip_wall`). | There is no in-engine geometry builder; a large terrain takes minutes to hours to build. |
@@ -194,6 +355,8 @@ To find the step, run in shorter calls.
 | Engine: build, default-off identity, refusals, one-step agreement with the reference, restart | Pass |
 | Engine, inclined channel, 65536 steps (FP32 storage) | Mass drift 1.1e-9, momentum 2.8e-7 (limits 1e-5); profile error 0.16 %, density departure 4.4e-5, normal velocity 1.8e-4 of the peak at every checkpoint; one-step map agreement at most 8.9e-16 (see the note below) |
 | Engine, terrain M3, 2000 steps (FP32 storage) | Mass drift 5.7e-11, momentum 7.7e-10 (limits 1e-5); one-step map agreement at most 8.9e-16 (see the note below); transfer active on all 152 links |
+| Engine, extended hill 160 x 64 x 25, 16000 updates, rest start, K_u = 1/1580, open x (task 129) | The registered gate set PASSED: open-boundary failures 0 at every checkpoint; largest per-update budget residual 9.0e-7 (mass) and 7.3e-7 (momentum); final cumulative residual 4.1e-11 (mass) and 3.6e-9 (momentum); the outlet normal speed positive at all 16 saved checkpoints (minimum 0.0133 at the first, 0.0220 at the end); wake front at most x = 125 of 159 at the saved checkpoints examined; inlet at 99.996 % of the target at update 16000 |
+| Hill demo targets against the accepted run, level 16000 | Raw populations, pending amounts and open state byte-identical (wall build). Single measurements: the wall run took 74.5 s for 16000 updates with three frames, the baseline run 3.4 s |
 
 The one-step map agreement (at most 8.9e-16) is not a trajectory difference. At each checkpoint, the run captured the
 input of one step and the output and intermediate arrays of the same step. The FP64 reference applies that step to the

@@ -72,11 +72,60 @@ Byte equivalence: the controls in "Controls" (historical) hold for the pre-task-
 M3 tables by round-off (above). The engine's acceptance fixture tests/data/slip_wall/M3_d3q27.vwnat (348f3ded) is unchanged
 and stays the engine input of the core acceptance.
 
+## V2 change: exact candidate window of the sampler (2026-11-10)
+
+builder3d.build_sampler took the candidates of every facet from all cells in 9 periodic images and sorted them (cost
+proportional to facets x cells). SamplerCandidates now builds them from a window of half width m around floor(x_s) and
+keeps the window only when its entry number NEIGHBOURS (12) has d2 < m^2. Otherwise m doubles. If a window shift leaves
+{-L, 0, L}, if m passes the box, or if a cell centroid lies outside its unit cell, the original full list is used.
+Proof (class docstring): every cell outside the window has d2 >= m^2 after the monotone binary64 rounding. So the first
+12 sorted tuples and the d2 == 0 set are the same objects as with the full list. The stencil rule, its gates, the tie
+order and every table are unchanged. terrain_container passes NEIGHBOURS and logs the counts of the window and of the
+full-list fallbacks. The build record is unchanged.
+
+Verification: the registered byte comparison of M3 and L24 against the current builder (E1). Development check
+(research tree v2/hill_inventory/e2/development/window_sampler_check.py): the window and the full list per facet, and
+build_sampler with and without the window, on M3 and on a 3 x 3 case whose window crosses both box edges, and the same
+case with a forced full-list fallback.
+
+## V2 change: the 12 nearest VISIBLE stencil candidates (2026-11-11, #2283)
+
+A SAMPLING-SELECTION rule change, not a change of fluid physics. Before: the sampler took the 12 nearest centroids by
+distance and then refused the facet (R3) if one of them was not visible from the sample. The steep qualification input S8
+was refused at 28 facets with one hidden candidate each, although an admissible visible stencil existed at every one of
+them (research tree v2/hill_inventory/e2/steep/V2_STEEP_R3_DIAGNOSIS_E2_2026-11-11.md). Now:
+SamplerCandidates.visible_prefix walks the same sorted list and keeps the exact (d2 == 0) entries and the candidates that
+pass the existing R3 segment test, until 12 are kept. The direct-centroid handling, the rank, condition and reproduction
+gates, and the R3 check of the chosen cells are unchanged. With fewer than 12 visible candidates, the facet is refused
+(R3). The window is accepted when its 12th VISIBLE entry has d2 < m^2, so the exactness of the window is kept. Where the
+12 nearest candidates are all visible (every facet of M3, L24 and the channel passed R3 under the old rule), the selected
+stencil is the same as before. The byte identity of those containers is to be shown by the registered comparison.
+R11 stays the default. `--allow-steep` skips only R11 (R10 and R1 stay) and records it in the build report
+(`allow_steep`, `domain_checks`). The steep geometry checks S8 and S8X qualify their own bounded inputs.
+
+## V2 change: local frames, exact piece volumes, parallel passes (2026-11-11, tasks 106 and 107)
+
+A GEOMETRY ARITHMETIC change; the clipping planes, keys, signs, ownership and tolerances are unchanged.
+- Facet area: a fan of vertex differences (translated_fan_area) in place of the global-coordinate shoelace.
+- Clipping in integer-local frames: the cell, the producer and the donor clip in the frame of their cell, with planes from
+  the exact triangle shifted by the integer origin; keys and moments are global.
+- Piece volumes and moments: every fan determinant is an exact integer (a common power-of-two scale of the binary64
+  coordinates), and every volume and moment weight is one correctly rounded division.
+- `--workers N`: the producer and donor passes on N processes; the container is the same, byte for byte, as with 1.
+- `--initial-velocity ux,uy,uz`: the uniform start f0 = feq3(1, u) (the reference equilibrium); the default stays the rest start.
+Effect on the maps: whole-cell transfers that binary64 gave as 1 +- a few ulps are now exactly 1.0, so rule #253 adds fewer
+cells to the wall list and the gradient sections are smaller (L24: 6619 -> 1936 gradient cells); the D, G, R, W values change
+at the rounding level (L24: at most 3.6e-12 against the shipped container). Qualification: the hill local acceptance
+(V2-HB-02/05), the all-facet area audit, and the M3, L24, S8 and S8X regressions (research tree, task 106).
+
 ## Example container
 
 `examples/volumetric_wall/L24_r12_d3q27.vwnat` (SHA-256
 9af23bbace3ca097feb0b71645ce49221112ced6eab73417825fe09c2b535edd, 20629360 bytes) is the container of the full L24 build
-above, shipped unchanged. Its build record is `examples/volumetric_wall/L24_r12_d3q27.vwnat.json`.
+above, shipped unchanged. Its build record is `examples/volumetric_wall/L24_r12_d3q27.vwnat.json`. It was built by the V1
+builder: a rebuild with the current builder is not byte-identical (see the V2 change above: 1936 instead of 6619 gradient
+cells; D weights within 3.6e-12). The earlier task-101 container (571223fc) is older than the task-103 contact fix and differs
+from the shipped one by the L24 contact defect (one donor volume by 1.37e-3); it is not a reference for the current builder.
 
 ## Example input
 

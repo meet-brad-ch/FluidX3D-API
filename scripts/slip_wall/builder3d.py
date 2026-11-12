@@ -106,28 +106,70 @@ class Poly:
         n = len(self.v)
         return (sum(p[0] for p in self.v) / n, sum(p[1] for p in self.v) / n, sum(p[2] for p in self.v) / n)
 
-    def volume(self):
-        g = self.interior()
-        tot = 0.0
+    # #2454, #2494: the fan tetrahedra (g, a, b, c) of the faces, every determinant EXACT, on one path for every polyhedron.
+    # The determinant is (a - g) . ((b - a) x (c - a)), equal to (a - g) . ((b - g) x (c - g)) (b - g = (a - g) + (b - a),
+    # c - g = (a - g) + (c - a); the cross terms with (a - g) are orthogonal to (a - g)). Every coordinate of g, a, b, c is a
+    # finite binary64 value n / d with d a power of 2. With D the largest d of the polyhedron, every coordinate times D is an
+    # integer, so the determinant of the scaled points is the exact integer D^3 det. Each volume and each moment weight is then
+    # ONE correctly rounded division (Python int / int), the value that float(Fraction) gives. A thin piece (thickness t,
+    # extent L) loses about u L / t in binary64 in any form, because g is only t/2 from its large faces; the exact integers lose
+    # nothing, so there is no binary64 branch and no error bound. The decomposition, the vertices, g, the abs per tetrahedron
+    # and the moment formula are those of fdb83d38.
+
+    def fan_tetrahedra(self):
+        """[(a, b, c)]: the fan triangles of every face, a = the face's first vertex (the order of volume() and moment())."""
+        out = []
         for face in self.f:
             a = self.v[face[0]]
             for q in range(1, len(face) - 1):
-                b, c = self.v[face[q]], self.v[face[q + 1]]
-                tot += abs(dotf(subf(a, g), crossf(subf(b, g), subf(c, g))))
-        return tot / 6.0
+                out.append((a, self.v[face[q]], self.v[face[q + 1]]))
+        return out
+
+    @staticmethod
+    def scaled_integers(points):
+        """(the points with every coordinate times D as exact integers, D): D is the largest denominator (a power of 2) of the
+        binary64 coordinates. Raises GeometryInvalid for a coordinate that is not finite."""
+        ratios = []
+        for p in points:
+            try:
+                ratios.append([x.as_integer_ratio() for x in p])
+            except (OverflowError, ValueError) as error:
+                raise GeometryInvalid(f"a polyhedron coordinate is not finite: {p}") from error
+        D = max(d for r in ratios for _, d in r)
+        return [tuple(n * (D // d) for n, d in r) for r in ratios], D
+
+    def tetra_determinants(self, g, tris):
+        """(|det_int| of every fan tetrahedron (g, a, b, c), the scale 6 D^3): the exact |det| / 6 is |det_int| / (6 D^3)."""
+        points = [g]
+        for a, b, c in tris:
+            points.extend((a, b, c))
+        ints, D = Poly.scaled_integers(points)
+        gi = ints[0]
+        dets = []
+        for t in range(len(tris)):
+            a, b, c = ints[1 + 3 * t], ints[2 + 3 * t], ints[3 + 3 * t]
+            x = (a[0] - gi[0], a[1] - gi[1], a[2] - gi[2])
+            y = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+            z = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
+            cross = (y[1] * z[2] - y[2] * z[1], y[2] * z[0] - y[0] * z[2], y[0] * z[1] - y[1] * z[0])
+            dets.append(abs(x[0] * cross[0] + x[1] * cross[1] + x[2] * cross[2]))
+        return dets, 6 * D ** 3
+
+    def volume(self):
+        g = self.interior()
+        dets, scale = self.tetra_determinants(g, self.fan_tetrahedra())
+        return sum(dets) / scale             # one correctly rounded division of exact integers
 
     def moment(self):
         g = self.interior()
-        vol, m = 0.0, [0.0, 0.0, 0.0]
-        for face in self.f:
-            a = self.v[face[0]]
-            for q in range(1, len(face) - 1):
-                b, c = self.v[face[q]], self.v[face[q + 1]]
-                w = abs(dotf(subf(a, g), crossf(subf(b, g), subf(c, g)))) / 6.0
-                vol += w
-                for k in range(3):
-                    m[k] += w * (g[k] + a[k] + b[k] + c[k]) / 4.0
-        return vol, m
+        tris = self.fan_tetrahedra()
+        dets, scale = self.tetra_determinants(g, tris)
+        m = [0.0, 0.0, 0.0]
+        for (a, b, c), det in zip(tris, dets):
+            w = det / scale                  # the exact weight |det| / 6, rounded once
+            for k in range(3):
+                m[k] += w * (g[k] + a[k] + b[k] + c[k]) / 4.0
+        return sum(dets) / scale, m          # the same volume as volume()
 
     def halfspaces(self):
         """Outward face planes (unit n, d) of this convex polyhedron."""
@@ -306,6 +348,24 @@ class Facet:
         return tuple(acc[k] / wsum for k in range(3))
 
 
+ORIGIN0 = (0, 0, 0)
+
+
+def shifted(tri, origin):
+    """The exact triangle translated by -origin (integers): the local frame of the clipping (task 106). Exact Fractions, so
+    the planes and polygons of a frame come from the exact data before any rounding."""
+    return tuple((p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]) for p in tri)
+
+
+def translated_fan_area(poly2):
+    """Signed area of a planar polygon (x, y) by a fan from its first vertex (task 106 P1). The products are of vertex
+    DIFFERENCES, so the rounding is relative to the polygon size, not to its position (the global-coordinate shoelace lost
+    up to 4.7e-7 relative on small facets of the hill, V2-HB-01)."""
+    x0, y0 = poly2[0][0], poly2[0][1]
+    return 0.5 * sum((poly2[q][0] - x0) * (poly2[q + 1][1] - y0) - (poly2[q + 1][0] - x0) * (poly2[q][1] - y0)
+                     for q in range(1, len(poly2) - 1))
+
+
 def polygon_clip2(poly, n, d):
     out = []
     m = len(poly)
@@ -322,7 +382,7 @@ def polygon_clip2(poly, n, d):
             out.append((p[0] + s * (r[0] - p[0]), p[1] + s * (r[1] - p[1])))
     if len(out) < 3:
         return None
-    area = 0.5 * sum(out[q][0] * out[(q + 1) % len(out)][1] - out[(q + 1) % len(out)][0] * out[q][1] for q in range(len(out)))
+    area = translated_fan_area(out)   # task 106 P1: the nonzero-area test does not depend on the position
     return out if abs(area) > 0.0 else None
 
 
@@ -339,7 +399,7 @@ class Builder:
                 for k in range(zmin, c.Z_top):
                     if k + 1 <= min(nodes):
                         continue                     # empty (exact classification)
-                    pieces = self.cell_pieces(i, j, k)
+                    pieces = self.cell_pieces(i, j, k, origin=(i, j, k))   # task 106: in the cell's own frame (donor_pass uses it)
                     vol, mom = 0.0, [0.0, 0.0, 0.0]
                     for pc in pieces:
                         v, m = pc.moment()
@@ -353,24 +413,30 @@ class Builder:
                         # (i + 1/2, j + 1/2, k + 1/2) (task26-diag-sampler-1 class B: the FP64 fan centroid carried ulp errors);
                         # the cut-cell and facet algorithms are unchanged
                         self.cells[(i, j, k)] = {"volume": 1.0, "centroid": (i + 0.5, j + 0.5, k + 0.5), "pieces": pieces, "class": "full",
-                                                 "fan_volume": vol}
+                                                 "fan_volume": vol, "centroid_local": (0.5, 0.5, 0.5)}
                     else:
-                        self.cells[(i, j, k)] = {"volume": vol, "centroid": tuple(mom[q] / vol for q in range(3)), "pieces": pieces,
-                                                 "class": "cut"}
+                        # task 106: the centroid of the local-frame moment, shifted back by the cell origin
+                        local = (mom[0] / vol, mom[1] / vol, mom[2] / vol)   # about the cell corner (i, j, k)
+                        self.cells[(i, j, k)] = {"volume": vol, "centroid": (local[0] + i, local[1] + j, local[2] + k),
+                                                 "pieces": pieces, "class": "cut", "centroid_local": local}
                     for f in self.terrain_facets(i, j, k):
                         self.facets[f.key] = f
                 lid = self.lid_facet(i, j)
                 self.facets[lid.key] = lid
         self.h, self.W, self.direct, self.vi = {}, {}, {}, {}
 
-    def cell_pieces(self, i, j, k):
+    def cell_pieces(self, i, j, k, origin=ORIGIN0):
+        """The fluid pieces of cell (i, j, k) in the frame of the integer origin (task 106: the planes come from the exact
+        triangle translated by -origin, so their offsets are small in the cell's own frame)."""
         out = []
+        ox, oy, oz = origin
         for tag, tri, trif in self.case.triangles(i, j):
-            a, b, g = (float(x) for x in exact_plane(tri))
-            P = Poly.box((float(i), float(j), float(k)), (float(i + 1), float(j + 1), float(k + 1)))
+            lt = shifted(tri, origin)
+            a, b, g = (float(x) for x in exact_plane(lt))
+            P = Poly.box((float(i - ox), float(j - oy), float(k - oz)), (float(i + 1 - ox), float(j + 1 - oy), float(k + 1 - oz)))
             ln = math.sqrt(a * a + b * b + 1.0)
             planes = [((a / ln, b / ln, -1.0 / ln), -g / ln)]
-            foot = [(p[0], p[1]) for p in trif]
+            foot = [(float(p[0]), float(p[1])) for p in lt]
             area = 0.5 * ((foot[1][0] - foot[0][0]) * (foot[2][1] - foot[0][1]) - (foot[2][0] - foot[0][0]) * (foot[1][1] - foot[0][1]))
             if area < 0:
                 foot = foot[::-1]
@@ -385,44 +451,72 @@ class Builder:
                 out.append(P)
         return out
 
-    def terrain_facets(self, i, j, k):
-        key = (i, j, k)
-        if key in self._fcache:
-            return self._fcache[key]
+    def terrain_facets(self, i, j, k, origin=ORIGIN0):
+        """The terrain facets of column (i, j) (unwrapped) and layer k, in the frame of the integer origin (task 106).
+        The polygon is clipped in the facet's OWN frame (i, j, k) from the exact triangle; its projected area (P1: a
+        translated fan) and so the area vector a are therefore the same in every frame. The polygon is shifted into the
+        requested frame, and the plane offset of that frame comes from the exact triangle translated by -origin.
+        Keys, cells, the exact normal and the exact global offset d_raw_exact do not depend on the frame."""
+        key = (i, j, k, origin)
+        if origin == ORIGIN0:
+            cache = self._fcache
+        else:
+            if getattr(self, "_lorigin", None) != origin:   # a local frame: one small cache per origin (the passes keep one origin)
+                self._lorigin, self._lcache = origin, {}
+            cache = self._lcache
+        if key in cache:
+            return cache[key]
         out = []
         c = self.case
+        ox, oy, oz = origin
         for tag, tri, trif in c.triangles(i, j):
             ae, be, ge = exact_plane(tri)
             if ae == 0 and be == 0 and math.floor(ge) != k:
                 continue
-            a, b, g = float(ae), float(be), float(ge)
-            foot = [(p[0], p[1]) for p in trif]
+            own = shifted(tri, (i, j, k))                   # the facet's own frame: footprint in [0, 1]^2, layer z in [0, 1]
+            _, _, go = exact_plane(own)
+            a, b, g_own = float(ae), float(be), float(go)
+            foot = [(float(p[0]), float(p[1])) for p in own]
             area = 0.5 * ((foot[1][0] - foot[0][0]) * (foot[2][1] - foot[0][1]) - (foot[2][0] - foot[0][0]) * (foot[1][1] - foot[0][1]))
             if area < 0:
                 foot = foot[::-1]
-            part = polygon_clip2(foot, (a, b), k + 1 - g)
-            part = polygon_clip2(part, (-a, -b), g - k) if part is not None else None
+            part = polygon_clip2(foot, (a, b), 1.0 - g_own)
+            part = polygon_clip2(part, (-a, -b), g_own) if part is not None else None
             if part is None:
                 continue
-            axy = 0.5 * sum(part[q][0] * part[(q + 1) % len(part)][1] - part[(q + 1) % len(part)][0] * part[q][1] for q in range(len(part)))
+            axy = translated_fan_area(part)                 # task 106 P1
             n_raw = (-a, -b, 1.0)
             avec = (axy * n_raw[0], axy * n_raw[1], axy * n_raw[2])
             ln = math.sqrt(dotf(n_raw, n_raw))
             unit = (n_raw[0] / ln, n_raw[1] / ln, n_raw[2] / ln)
-            poly = [(p[0], p[1], a * p[0] + b * p[1] + g) for p in part]
+            dx, dy, dz = float(i - ox), float(j - oy), float(k - oz)
+            poly = [(p[0] + dx, p[1] + dy, a * p[0] + b * p[1] + g_own + dz) for p in part]
+            _, _, g_frame = exact_plane(shifted(tri, origin))
             out.append(Facet(("T", i % c.Lx, j % c.Ly, tag, k), poly, (-ae, -be, F(1)), avec, unit, (i % c.Lx, j % c.Ly, k),
-                             (unit, g / ln), ge))
-        self._fcache[key] = out
+                             (unit, float(g_frame) / ln), ge))
+        cache[key] = out
         return out
 
-    def lid_facet(self, i, j):
+    def lid_facet(self, i, j, origin=ORIGIN0):
+        """The lid facet of column (i, j) (unwrapped) in the frame of the integer origin (task 106)."""
         c = self.case
-        Z = float(c.Z_top)
-        poly = [(float(i), float(j), Z), (float(i + 1), float(j), Z), (float(i + 1), float(j + 1), Z), (float(i), float(j + 1), Z)]
+        ox, oy, oz = origin
+        Z = float(c.Z_top - oz)
+        x0, y0 = float(i - ox), float(j - oy)
+        poly = [(x0, y0, Z), (x0 + 1.0, y0, Z), (x0 + 1.0, y0 + 1.0, Z), (x0, y0 + 1.0, Z)]
         return Facet(("L", i % c.Lx, j % c.Ly), poly, (F(0), F(0), F(-1)), (0.0, 0.0, -1.0), (0.0, 0.0, -1.0), (i % c.Lx, j % c.Ly, c.Z_top - 1),
                      ((0.0, 0.0, -1.0), -Z), F(-c.Z_top))
 
-    def candidates(self, i, j, k, exclude=None):
+    def facet_in_frame(self, f, origin):
+        """The facet f (a canonical facet of self.facets) built again in the frame of the integer origin (task 106)."""
+        if f.key[0] == "L":
+            return self.lid_facet(f.key[1], f.key[2], origin)
+        for g in self.terrain_facets(f.key[1], f.key[2], f.key[4], origin):
+            if g.key == f.key:
+                return g
+        raise GeometryInvalid(f"facet {f.key} is not rebuilt in the frame {origin}")
+
+    def candidates(self, i, j, k, exclude=None, origin=ORIGIN0):
         c = self.case
         out = []
         for di in (-1, 0, 1):
@@ -430,17 +524,18 @@ class Builder:
                 ii, jj = i + di, j + dj
                 img = (ii - ii % c.Lx, jj - jj % c.Ly)
                 for kk in (k - 1, k, k + 1):
-                    for f in self.terrain_facets(ii, jj, kk):
+                    for f in self.terrain_facets(ii, jj, kk, origin):
                         if f.key != exclude:
                             out.append((f, img))
                 if c.Z_top - 1 in (k - 1, k, k + 1):
-                    lid = self.lid_facet(ii, jj)
+                    lid = self.lid_facet(ii, jj, origin)
                     if lid.key != exclude:
                         out.append((lid, img))
         return out
 
     def producer_pass(self, fkey, d):
-        """Row (fkey, d): immediate region h per (cell, image) and W per first receiver (Cartesian BSP)."""
+        """Row (fkey, d): immediate region h per (cell, image) and W per first receiver (Cartesian BSP). Task 106: the
+        clipping runs in the frame of the producer's cell (the producer and its receivers rebuilt there from the exact data)."""
         f = self.facets[fkey]
         c = LEX19[d]
         if f.sign(c) <= 0:
@@ -451,10 +546,11 @@ class Builder:
         self.vi[(fkey, d)] = vi
         i0 = math.floor(min(p[0] for p in f.poly))
         j0 = math.floor(min(p[1] for p in f.poly))
-        recv = [(g, img) for g, img in self.candidates(i0, j0, f.cell[2], exclude=fkey) if g.sign(c) < 0]
-        free, owned = self.producer_partition(f, c, recv)
+        origin = tuple(f.cell)
+        recv = [(g, img) for g, img in self.candidates(i0, j0, f.cell[2], exclude=fkey, origin=origin) if g.sign(c) < 0]
+        free, owned = self.producer_partition(self.facet_in_frame(f, origin), c, recv)
         for p in free:
-            self.add_h(fkey, d, p)
+            self.add_h(fkey, d, p, origin)
         for p, (g, img) in owned:
             self.add_w(fkey, d, g, img, p)
 
@@ -534,19 +630,22 @@ class Builder:
         key = (fkey, d, g.key, img)
         self.W[key] = self.W.get(key, 0.0) + v
 
-    def add_h(self, fkey, d, p):
+    def add_h(self, fkey, d, p, origin=ORIGIN0):
+        """The free piece p (in the frame of origin) split by the cells; keys are global (task 106)."""
         xs = [q[0] for q in p.v]
         ys = [q[1] for q in p.v]
         zs = [q[2] for q in p.v]
         c = self.case
-        for ci in range(math.floor(min(xs)), math.ceil(max(xs))):
-            for cj in range(math.floor(min(ys)), math.ceil(max(ys))):
-                for ck in range(math.floor(min(zs)), math.ceil(max(zs))):
+        ox, oy, oz = origin
+        for li in range(math.floor(min(xs)), math.ceil(max(xs))):
+            for lj in range(math.floor(min(ys)), math.ceil(max(ys))):
+                for lk in range(math.floor(min(zs)), math.ceil(max(zs))):
                     q = p
-                    for n, dd in Poly.box((float(ci), float(cj), float(ck)), (float(ci + 1), float(cj + 1), float(ck + 1))).halfspaces():
+                    for n, dd in Poly.box((float(li), float(lj), float(lk)), (float(li + 1), float(lj + 1), float(lk + 1))).halfspaces():
                         q = clip(q, n, dd) if q is not None else None
                     if q is None:
                         continue
+                    ci, cj, ck = li + ox, lj + oy, lk + oz
                     v = checked_volume(q, ("h", fkey, d, ci, cj, ck))
                     self.note_small(v)
                     cell = (ci % c.Lx, cj % c.Ly, ck)
@@ -562,11 +661,11 @@ class Builder:
     def donor_pass(self, cell, d):
         c = LEX19[d]
         i, j, k = cell
-        pieces = list(self.cells[cell]["pieces"])
-        for g, img in self.candidates(i, j, k):
+        pieces = list(self.cells[cell]["pieces"])            # task 106: in the cell's own frame
+        for g, img in self.candidates(i, j, k, origin=(i, j, k)):
             if g.sign(c) >= 0:
                 continue
-            S = Poly.prism(g.poly, (-c[0], -c[1], -c[2]))     # unwrapped at its image (#548)
+            S = Poly.prism(g.poly, (-c[0], -c[1], -c[2]))     # unwrapped at its image (#548), in the cell's frame
             _, pieces = subtract_convex(pieces, S.halfspaces(), self.diag)
             if not pieces:
                 break
@@ -649,9 +748,129 @@ def segment_free(case: Case, p, q) -> bool:
     return True
 
 
-def build_sampler(b: Builder, stencil_weights) -> dict:
+class SamplerCandidates:
+    """The sorted candidate list of build_sampler, by the full list (the original code) or by an EXACT window (V2, #2213).
+
+    The stencil rule reads only the candidates with d2 == 0 and the first `neighbours` entries of the list sorted by
+    (d2, cell index, x shift, y shift); this key is unique per candidate, so the order does not depend on the build order.
+    Window of half width m around floor(x_s): the cells with lattice index I = i + sx, J = j + sy, K = k within m of
+    floor(x_s) on each axis, with sx, sy in {-Lx, 0, Lx} x {-Ly, 0, Ly} (the shifts of the full list) and no z image.
+    Exclusion bound: a cell outside the window has |index - floor(x_s)| >= m + 1 on one axis; its centroid lies in its unit
+    cell (checked for every cell at construction, else the full list is used for every facet) and x_s lies in
+    [floor(x_s), floor(x_s) + 1], so that component of delta is >= m in magnitude, also after the monotone binary64
+    rounding of ce + sx - xs (m is exact); the squares and their sum are >= m^2 for the same reason. The window is accepted
+    only if it holds at least `neighbours` candidates and its entry number `neighbours` has d2 < m^2: then no outside cell
+    can be among the first entries, tie with them, or have d2 == 0, and the first entries are the same tuples (the same
+    expressions) as in the full list. Otherwise m doubles; a shift outside {-L, 0, L} or m beyond the box gives the full list.
+
+    V2 visible-stencil rule (#2283; diagnosis V2_STEEP_R3_DIAGNOSIS_E2_2026-11-11.md): with visible_only, the list returned is
+    the VISIBLE PREFIX: the sorted candidates in the same order, keeping every d2 == 0 entry (the direct-centroid handling is
+    unchanged; R3 still checks it) and every candidate whose segment from x_s is free (the existing R3 test segment_free),
+    until `neighbours` entries are kept. The window is accepted when its visible prefix is complete and its last entry has
+    d2 < m^2: every candidate ahead of that entry in the full order then has d2 < m^2 and lies inside the window, so the
+    visible prefix equals the one of the full list. Where the first `neighbours` candidates are all visible, the prefix is
+    exactly the old first entries (the same stencil). The rank, condition and reproduction gates are unchanged.
+    """
+
+    START = 3
+
+    def __init__(self, case, keys: list, cents: list, neighbours: int | None, visible_only: bool = False) -> None:
+        self.c, self.cents, self.neighbours = case, cents, neighbours
+        self.visible_only = visible_only and neighbours is not None
+        self.skipped_hidden = 0
+        self.index = {k: n for n, k in enumerate(keys)}
+        self.contained = all(k[a] <= ce[a] <= k[a] + 1 for k, ce in zip(keys, cents) for a in range(3))
+        ks = [k[2] for k in keys]
+        self.limit = max(case.Lx, case.Ly, (max(ks) - min(ks) + 1) if ks else 1)
+        self.full_count, self.window_count, self.largest_m = 0, 0, 0
+
+    @staticmethod
+    def _sort(cand: list) -> list:
+        cand.sort(key=lambda z: (z[0], z[1], z[3], z[4]))
+        return cand
+
+    def full(self, xs) -> list:
+        """The original candidate list (builder3d before V2), unchanged."""
+        c, cand = self.c, []
+        for sx in (-c.Lx, 0, c.Lx):
+            for sy in (-c.Ly, 0, c.Ly):
+                for idx, ce in enumerate(self.cents):
+                    delta = np.array([ce[0] + sx - xs[0], ce[1] + sy - xs[1], ce[2] - xs[2]])
+                    cand.append((float(delta @ delta), idx, 0, sx, sy, delta))
+        return self._sort(cand)
+
+    def window(self, xs, m: int) -> list | None:
+        """The window candidates (the same tuples as in the full list), or None if a shift leaves {-L, 0, L}."""
+        c, cand = self.c, []
+        fx, fy, fz = (math.floor(v) for v in xs)
+        for I in range(fx - m, fx + m + 1):
+            i = I % c.Lx
+            sx = I - i
+            if sx not in (-c.Lx, 0, c.Lx):
+                return None
+            for J in range(fy - m, fy + m + 1):
+                j = J % c.Ly
+                sy = J - j
+                if sy not in (-c.Ly, 0, c.Ly):
+                    return None
+                for K in range(fz - m, fz + m + 1):
+                    idx = self.index.get((i, j, K))
+                    if idx is None:
+                        continue
+                    ce = self.cents[idx]
+                    delta = np.array([ce[0] + sx - xs[0], ce[1] + sy - xs[1], ce[2] - xs[2]])
+                    cand.append((float(delta @ delta), idx, 0, sx, sy, delta))
+        return self._sort(cand)
+
+    def visible_prefix(self, xs, cand: list) -> list:
+        """The first `neighbours` candidates that are exact (d2 == 0) or visible from x_s, in the sorted order."""
+        n, kept, hidden = self.neighbours, [], 0
+        for z in cand:
+            if len(kept) == n:
+                break
+            ce = self.cents[z[1]]
+            if z[0] == 0.0 or segment_free(self.c, xs, (ce[0] + z[3], ce[1] + z[4], ce[2])):
+                kept.append(z)
+            else:
+                hidden += 1
+        self.skipped_hidden += hidden
+        return kept
+
+    def sorted_candidates(self, xs) -> list:
+        n = self.neighbours
+        if n is not None and self.contained:
+            m = self.START
+            while m <= self.limit:
+                cand = self.window(xs, m)
+                if cand is None:
+                    break
+                if self.visible_only:
+                    prefix = self.visible_prefix(xs, cand)
+                    if len(prefix) == n and prefix[-1][0] < float(m * m):
+                        self.window_count += 1
+                        self.largest_m = max(self.largest_m, m)
+                        return prefix
+                elif len(cand) >= n and cand[n - 1][0] < float(m * m):
+                    self.window_count += 1
+                    self.largest_m = max(self.largest_m, m)
+                    return cand
+                m *= 2
+        self.full_count += 1
+        cand = self.full(xs)
+        if self.visible_only:
+            prefix = self.visible_prefix(xs, cand)
+            if len(prefix) < n:
+                raise GeometryRejected(f"R3: only {len(prefix)} visible stencil candidates (need {n}) for the sample {[float(v) for v in xs]}")
+            return prefix
+        return cand
+
+
+def build_sampler(b: Builder, stencil_weights, neighbours: int | None = None, visible_only: bool = False) -> dict:
     """x_s = facet centroid + n/2; 12 nearest 3D cell centroids with x/y images (no z image), the accepted task-22
-    stencil_weights (direct_centroid / least squares with its gates); R2 and R3 visibility by segment_free."""
+    stencil_weights (direct_centroid / least squares with its gates); R2 and R3 visibility by segment_free.
+    neighbours: the number of first candidates that stencil_weights reads (None: the full list for every facet, the
+    original path); with a number, SamplerCandidates uses the exact window (V2, #2213).
+    visible_only (V2, #2283): the 12 nearest VISIBLE candidates (SamplerCandidates.visible_prefix); the R3 check below stays."""
     c = b.case
     keys = sorted(b.cells)
     cents = [b.cells[k]["centroid"] for k in keys]
@@ -659,19 +878,17 @@ def build_sampler(b: Builder, stencil_weights) -> dict:
     facet_keys = sorted(b.facets, key=str)
     points = []
     per_facet_branch = {}
+    source = SamplerCandidates(c, keys, cents, neighbours, visible_only)
     for fi, fkey in enumerate(facet_keys):
         f = b.facets[fkey]
         cen = f.centroid()
         xs = tuple(cen[k] + 0.5 * f.unit[k] for k in range(3))
         if not segment_free(c, cen if fkey[0] == "L" else tuple(cen[k] + 1e-9 * f.unit[k] for k in range(3)), xs):
             raise GeometryRejected(f"R2: sample of facet {fkey} not visible")
-        cand = []
-        for sx in (-c.Lx, 0, c.Lx):
-            for sy in (-c.Ly, 0, c.Ly):
-                for idx, ce in enumerate(cents):
-                    delta = np.array([ce[0] + sx - xs[0], ce[1] + sy - xs[1], ce[2] - xs[2]])
-                    cand.append((float(delta @ delta), idx, 0, sx, sy, delta))
-        cand.sort(key=lambda z: (z[0], z[1], z[3], z[4]))
+        try:
+            cand = source.sorted_candidates(xs)
+        except GeometryRejected as e:  # the visible prefix is incomplete: the rejection names the facet
+            raise GeometryRejected(f"{e} at facet {fkey}") from e
         try:
             branch, chosen, coeff, cond, rep = stencil_weights(cand, 1)
         except Exception as e:  # noqa: BLE001  #558: the rejection carries the facet, sample and nearest distance
@@ -692,4 +909,7 @@ def build_sampler(b: Builder, stencil_weights) -> dict:
         raise GeometryRejected(f"R3: reproduction {max(repro)} / condition {max(conds)}")
     return {"keys": keys, "facet_keys": facet_keys, "rows": rows, "cols": cols, "vals": vals, "points": points, "branches": branches,
             "per_facet_branch": per_facet_branch,
-            "reproduction_max": max(repro) if repro else None, "condition_max": max(conds) if conds else None}
+            "reproduction_max": max(repro) if repro else None, "condition_max": max(conds) if conds else None,
+            "candidate_source": {"window": source.window_count, "full_list": source.full_count, "largest_m": source.largest_m,
+                                 "centroids_in_cells": source.contained, "visible_only": source.visible_only,
+                                 "hidden_candidates_skipped": source.skipped_hidden}}

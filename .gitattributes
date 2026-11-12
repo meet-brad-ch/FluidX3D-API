@@ -6,3 +6,5 @@ src/setup.cpp linguist-documentation
 scripts/*.sh text eol=lf
 examples/volumetric_wall/*.csv -text
 examples/volumetric_wall/*.vwnat binary
+# task 128: the packaged research tools are VERBATIM and pinned by sha256 (scripts/slip_wall/hill_tables/MANIFEST.sha256, checked by prepare_hill_container.py): no end-of-line conversion on any platform
+scripts/slip_wall/hill_tables/tree/** -text

@@ -12,6 +12,7 @@ the Setup API ([README.md](README.md#setup-api)); its extensions are named in it
 | **taylor_green_2d** | D2Q9, INTERACTIVE_GRAPHICS | - |
 | **poiseuille_flow** | VOLUME_FORCE | - |
 | **volumetric_wall** (targets volumetric_wall_rr27, volumetric_wall_noslip, *_visual, and the earlier D3Q19 volumetric_wall) | D3Q27, VOLUMETRIC_WALL, VOLUMETRIC_WALL_FP64_COLLISION, VOLUMETRIC_WALL_RR27, VOLUME_FORCE (the baseline: D3Q27, VOLUME_FORCE) | the ready container examples/volumetric_wall/L24_r12_d3q27.vwnat, or a VWNAT01 container from scripts/slip_wall/terrain_container.py |
+| **volumetric_wall** V2 hill (targets volumetric_wall_rr27_sgs_rough_open_visual / _live, volumetric_wall_noslip_open_visual / _live) | the above with VOLUMETRIC_WALL_SGS, VOLUMETRIC_WALL_ROUGH, VOLUMETRIC_WALL_OPEN_X, VOLUMETRIC_WALL_T119, VOLUMETRIC_WALL_SRD (the wall targets), GRAPHICS or INTERACTIVE_GRAPHICS (the baseline: D3Q27, SUBGRID, EQUILIBRIUM_BOUNDARIES, VOLUME_FORCE, graphics) | a container built from examples/volumetric_wall/hill_64_apron8_ext80_heights.csv with scripts/slip_wall/hill_tables (research/slip_wall/README.md); EXPERIMENTAL: the run of that recipe passed its gates and is accepted for one declared regime (160 x 64 x 25, rest start, K_u = 1/1580, outflow-only outlet), not for other terrain, domains or inlets |
 | **stokes_drag** | FORCE_FIELD, EQUILIBRIUM_BOUNDARIES | - |
 | **cylinder_duct** | VOLUME_FORCE, INTERACTIVE_GRAPHICS | - |
 | **taylor_couette** | MOVING_BOUNDARIES, INTERACTIVE_GRAPHICS | - |

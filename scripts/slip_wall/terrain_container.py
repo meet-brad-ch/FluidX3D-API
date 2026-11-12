@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import multiprocessing
 import json
 import math
 import platform
@@ -157,6 +158,7 @@ class TerrainManifest:
     Z_top: int
     heights: dict      # (i, j) -> Fraction
     diagonal: dict     # (i, j) -> "main" or "anti"
+    allow_steep: bool = False  # V2 --allow-steep: skip ONLY the R11 slope check (R10 and R1 stay); recorded in the build report
 
     def h(self, i, j):
         return self.heights[(i % self.Lx, j % self.Ly)]
@@ -178,16 +180,18 @@ class TerrainManifest:
         return (nd[(1, 0)], nd[(0, 1)]), (nd[(0, 0)], nd[(1, 1)])
 
     def domain_checks(self) -> None:
-        """oracle3d.domain_checks with both flags on: R10 lid clearance >= 2, R11 slopes |a|, |b| < 1, R1 connectivity."""
+        """oracle3d.domain_checks with both flags on: R10 lid clearance >= 2, R11 slopes |a|, |b| < 1, R1 connectivity.
+        With allow_steep (V2), R11 is skipped and R10 and R1 are kept (the research steep path of S8 and S8X)."""
         hmax = max(self.heights.values())
         if self.Z_top - hmax < 2:
             raise B.GeometryRejected(f"R10: clearance {self.Z_top - hmax} < 2")
-        for i in range(self.Lx):
-            for j in range(self.Ly):
-                for tag, tri in self.triangles(i, j):
-                    a, b, _ = plane_of(tri)
-                    if abs(a) >= 1 or abs(b) >= 1:
-                        raise B.GeometryRejected(f"R11: slope ({a}, {b}) at column ({i}, {j}) {tag}")
+        if not self.allow_steep:
+            for i in range(self.Lx):
+                for j in range(self.Ly):
+                    for tag, tri in self.triangles(i, j):
+                        a, b, _ = plane_of(tri)
+                        if abs(a) >= 1 or abs(b) >= 1:
+                            raise B.GeometryRejected(f"R11: slope ({a}, {b}) at column ({i}, {j}) {tag}")
         for i in range(self.Lx):
             for j in range(self.Ly):
                 diag, off = self.diagonal_nodes(i, j)
@@ -255,6 +259,37 @@ class VelocitySet:
         return VelocitySet(name, directions, weights, opposites, rest)
 
 
+class UniformStart:
+    """V2 (task 107, #2505): the uniform initial state f0 = feq3(1, u) in every cell, for an open-x run that starts at the
+    inflow. feq3 = w rho B with B = 1 + 3 cu + 9/2 cu^2 - 3/2 uu + 9/2 (cu^3 - cu uu): the reference Equilibrium.parts
+    (research/wall_model/integration/task87/t87_model.py, force 0) with its operation order, so f0 is the same, bit for bit,
+    as the reference preparation (v2/open_terrain/e1/native/e1_ob_case.py). s0 stays the rest prehistory W w_rd, as there."""
+
+    def __init__(self, vs: VelocitySet) -> None:
+        self.c = vs.c_array
+        self.w = vs.w_array
+
+    def f0(self, cells: int, velocity: tuple) -> np.ndarray:
+        rho = np.full(cells, 1.0)
+        u = np.tile(np.array(velocity, dtype=np.float64), (cells, 1))
+        cu = u @ self.c.T
+        uu = (u * u).sum(axis=1)[:, None]
+        bracket = 1.0 + 3.0 * cu + 4.5 * cu * cu - 1.5 * uu + 4.5 * (cu * cu * cu - cu * uu)
+        feq = self.w[None, :] * rho[:, None] * bracket
+        return feq.reshape(-1)
+
+    @staticmethod
+    def parse(text: str) -> tuple:
+        """"ux,uy,uz" as three finite numbers with |u| < c = 1/sqrt(3); raises ValueError otherwise."""
+        items = text.split(",")
+        if len(items) != 3:
+            raise ValueError(f"--initial-velocity needs three comma-separated numbers (it is {text!r})")
+        u = tuple(float(v) for v in items)
+        if not all(math.isfinite(v) for v in u) or not math.sqrt(sum(v * v for v in u)) < 1.0 / math.sqrt(3.0):
+            raise ValueError(f"--initial-velocity {text!r} must be finite with |u| < c = 1/sqrt(3)")
+        return u
+
+
 class MapIdentities:
     """t87_geometry.MapAssembler: identities, permute_rows, base_rows (velocity set as a parameter)."""
 
@@ -299,7 +334,7 @@ def arms(vs: VelocitySet, builder, maps: dict, permuted: dict) -> dict:
     """t87_geometry.VelocityExport.arms: part centroid - fluid centroid of the cell, per D and G entry."""
     q = vs.q
     keys, rows = maps["keys"], maps["rows"]
-    centroid_local = np.array([builder.cells[k]["centroid"] for k in keys]) - np.array(keys, float)
+    centroid_local = np.array([builder.cells[k]["centroid_local"] for k in keys])   # task 106: about the cell corner, from the local frame
     direct = permuted["D"].tocoo()
     direct_arm = np.zeros((direct.nnz, 3))
     for n, column in enumerate(direct.col.tolist()):
@@ -317,6 +352,83 @@ def arms(vs: VelocitySet, builder, maps: dict, permuted: dict) -> dict:
         part = builder.h_moment[(fkey, d, keys[cell])]
         prism_arm[n] = np.array(part[1:]) / part[0] - centroid_local[cell]
     return {"direct_arm": direct_arm, "prism_arm": prism_arm, "wall_cells": np.unique(gather.col // q)}
+
+
+# ---------------------------------------------------------------- parallel pass workers (module level: picklable under spawn)
+_PASS_WORKER: dict = {}
+
+
+def _pass_worker_init(record: dict, velocities: str) -> None:
+    """Builds the same builder as the parent (cells and facets from the record) and records the Diag events of its passes:
+    split() runs on a fresh probe Diag (0.0 + defect = defect exactly) and note_small appends the small volumes.
+    An exception here is kept and raised by the first task: multiprocessing.Pool restarts a worker whose initializer fails,
+    so a failing initializer would never end the build."""
+    try:
+        _pass_worker_setup(record, velocities)
+    except Exception as error:  # noqa: BLE001  (kept and raised by every task: fail closed)
+        _PASS_WORKER.update(error=f"{type(error).__name__}: {error}")
+
+
+def _pass_worker_builder():
+    """The worker's builder, or the error of its initializer as a RuntimeError."""
+    if "error" in _PASS_WORKER:
+        raise RuntimeError(f"INVALID: parallel worker initialization failed: {_PASS_WORKER['error']}")
+    return _PASS_WORKER["b"]
+
+
+def _pass_worker_setup(record: dict, velocities: str) -> None:
+    b = VelocityMomentTerrainBuilder(record, VelocitySet.named(velocities))
+    events: list = []
+    original_split = B.split
+
+    def split_recorded(P, n, d, diag):
+        probe = B.Diag()
+        lo, hi = original_split(P, n, d, probe)
+        events.append(("d", probe.sum_defect))
+        return lo, hi
+
+    def note_small_recorded(v):
+        if v <= B.SMALL:
+            events.append(("s", v))
+
+    B.split = split_recorded
+    b.note_small = note_small_recorded
+    _PASS_WORKER.update(b=b, events=events)
+
+
+def _pass_worker_take() -> tuple:
+    """The events and the pass state written since the last take, then empty containers for the next row or state."""
+    b, events = _PASS_WORKER["b"], _PASS_WORKER["events"]
+    state = []
+    for name in VelocityMomentTerrainBuilder.PASS_STATE:
+        items = list(getattr(b, name).items())
+        if items:
+            state.append((name, items))
+        setattr(b, name, {})
+    taken = list(events)
+    events.clear()
+    return taken, state
+
+
+def _pass_worker_producer(fkey) -> list:
+    b = _pass_worker_builder()
+    _pass_worker_take()
+    out = []
+    for d in range(b.velocity_set.q):
+        if b.velocity_set.directions[d] != (0, 0, 0):
+            b.producer_pass(fkey, d)
+            out.append(_pass_worker_take())
+    return out
+
+
+def _pass_worker_donor(cell) -> list:
+    b = _pass_worker_builder()
+    _pass_worker_take()
+    out = []
+    for d in range(b.velocity_set.q):
+        b.donor_pass(cell, d)
+        out.append(_pass_worker_take())
+    return out
 
 
 # ---------------------------------------------------------------- task95/t95_geometry.py: velocity-set builder, assembly, gradient, wall list
@@ -359,28 +471,32 @@ class VelocityMomentTerrainBuilder(B.Builder):
         self.vi[(fkey, d)] = vi
         i0 = math.floor(min(p[0] for p in f.poly))
         j0 = math.floor(min(p[1] for p in f.poly))
+        origin = tuple(f.cell)                       # task 106: the clipping runs in the frame of the producer's cell
         outgoing = self.swept(self.facet_box(f, (0, 0)), c)
-        recv = [(g, img) for g, img in self.candidates(i0, j0, f.cell[2], exclude=fkey)
+        recv = [(g, img) for g, img in self.candidates(i0, j0, f.cell[2], exclude=fkey, origin=origin)
                 if g.sign(c) < 0 and self.positive_overlap(outgoing, self.swept(self.facet_box(g, img), c))]
-        free, owned = self.producer_partition(f, c, recv)
+        free, owned = self.producer_partition(self.facet_in_frame(f, origin), c, recv)
         for p in free:
-            self.add_h(fkey, d, p)
+            self.add_h(fkey, d, p, origin)
         for p, (g, img) in owned:
             self.add_w(fkey, d, g, img, p)
 
-    def add_h(self, fkey, d, p):
+    def add_h(self, fkey, d, p, origin=B.ORIGIN0):
+        """The free piece p (in the frame of origin) split by the cells; keys and moments are global (task 106)."""
         xs = [q[0] for q in p.v]
         ys = [q[1] for q in p.v]
         zs = [q[2] for q in p.v]
         c = self.case
-        for ci in range(math.floor(min(xs)), math.ceil(max(xs))):
-            for cj in range(math.floor(min(ys)), math.ceil(max(ys))):
-                for ck in range(math.floor(min(zs)), math.ceil(max(zs))):
+        ox, oy, oz = origin
+        for li in range(math.floor(min(xs)), math.ceil(max(xs))):
+            for lj in range(math.floor(min(ys)), math.ceil(max(ys))):
+                for lk in range(math.floor(min(zs)), math.ceil(max(zs))):
                     q = p
-                    for n, dd in B.Poly.box((float(ci), float(cj), float(ck)), (float(ci + 1), float(cj + 1), float(ck + 1))).halfspaces():
+                    for n, dd in B.Poly.box((float(li), float(lj), float(lk)), (float(li + 1), float(lj + 1), float(lk + 1))).halfspaces():
                         q = B.clip(q, n, dd) if q is not None else None
                     if q is None:
                         continue
+                    ci, cj, ck = li + ox, lj + oy, lk + oz
                     v = B.checked_volume(q, ("h", fkey, d, ci, cj, ck))
                     self.note_small(v)
                     cell = (ci % c.Lx, cj % c.Ly, ck)
@@ -388,22 +504,22 @@ class VelocityMomentTerrainBuilder(B.Builder):
                     key = (fkey, d, cell, img)
                     self.h[key] = self.h.get(key, 0.0) + v
                     volume, moment = q.moment()
-                    corner = (ci, cj, ck)
+                    corner = (li, lj, lk)            # the cell corner in the frame of origin: the part moment about it is frame-free
                     part = self.h_moment.setdefault((fkey, d, cell), [0.0, 0.0, 0.0, 0.0])
                     row = self.row_moment.setdefault((fkey, d), [0.0, 0.0, 0.0, 0.0])
                     part[0] += volume
                     row[0] += volume
                     for k in range(3):
                         part[1 + k] += moment[k] - volume * corner[k]
-                        row[1 + k] += moment[k]
+                        row[1 + k] += moment[k] + volume * origin[k]   # the row moment stays global
 
     def donor_pass(self, cell, d):
         c = self.velocity_set.directions[d]
         i, j, k = cell
-        pieces = list(self.cells[cell]["pieces"])
+        pieces = list(self.cells[cell]["pieces"])            # task 106: in the cell's own frame
         cell_box = ((i, j, k), (i + 1, j + 1, k + 1))
         back = (-c[0], -c[1], -c[2])
-        for g, img in self.candidates(i, j, k):
+        for g, img in self.candidates(i, j, k, origin=(i, j, k)):
             if g.sign(c) >= 0:
                 continue
             if not self.positive_overlap(cell_box, self.swept(self.facet_box(g, img), back)):
@@ -421,9 +537,59 @@ class VelocityMomentTerrainBuilder(B.Builder):
             volume, moment = p.moment()
             part[0] += volume
             for q in range(3):
-                part[1 + q] += moment[q] - volume * cell[q]
+                part[1 + q] += moment[q]           # task 106: the pieces are in the cell's own frame, so this is the moment about the cell corner
         self.direct[(cell, d)] = v
         self.direct_moment[(cell, d)] = part
+
+    # ---- parallel passes (bitwise the serial result) -----------------------------------------------------------------------
+    # Every key the passes write belongs to ONE producer row (fkey, d) or ONE donor state (cell, d): h, W, vi, h_moment and
+    # row_moment to its row, direct and direct_moment to its state. So a worker computes the final value of every key of its
+    # rows. The parent inserts the rows in the serial order of run() (so every dict has the serial insertion order) and replays
+    # each row's Diag events (the split defects and the small pieces, in the order they happened) on its own Diag with the
+    # serial statements. The container is therefore the same, byte for byte, as with run().
+    PASS_STATE = ("h", "W", "vi", "h_moment", "row_moment", "direct", "direct_moment")
+
+    def merge(self, result) -> None:
+        """One row or donor state from a worker: its Diag events replayed in order, then its keys in insertion order."""
+        events, state = result
+        before = self.diag.sum_defect
+        for kind, value in events:
+            if kind == "d":
+                self.diag.max_defect = max(self.diag.max_defect, value)
+                self.diag.sum_defect += value
+            else:
+                self.diag.small_count += 1
+                self.diag.small_total += value
+        self.diag.max_unit_sum = max(self.diag.max_unit_sum, self.diag.sum_defect - before)
+        for name, items in state:
+            target = getattr(self, name)
+            for key, value in items:
+                if key in target:
+                    raise RuntimeError(f"INVALID: parallel merge: key {key!r} of {name} written by two rows")
+                target[key] = value
+
+    def run_parallel(self, record: dict, workers: int, progress=None) -> None:
+        """run() on `workers` processes; the result equals run() bitwise (see PASS_STATE)."""
+        q = self.velocity_set.q
+        facets = sorted(self.facets, key=str)
+        cells = sorted(self.cells)
+        context = multiprocessing.get_context("spawn")
+        with context.Pool(workers, initializer=_pass_worker_init, initargs=(record, self.velocity_set.name)) as pool:
+            moving = sum(1 for c in self.velocity_set.directions if c != (0, 0, 0))
+            for n, rows in enumerate(pool.imap(_pass_worker_producer, facets, chunksize=4)):
+                if len(rows) != moving:
+                    raise RuntimeError("INVALID: parallel producer task returned a wrong number of rows")
+                for result in rows:
+                    self.merge(result)
+                if progress:
+                    progress("facet", n)
+            for n, states in enumerate(pool.imap(_pass_worker_donor, cells, chunksize=16)):
+                if len(states) != q:
+                    raise RuntimeError("INVALID: parallel donor task returned a wrong number of states")
+                for result in states:
+                    self.merge(result)
+                if progress:
+                    progress("cell", n)
 
     def run(self, progress=None):
         q = self.velocity_set.q
@@ -579,13 +745,87 @@ def wall_list(vs: VelocitySet, builder, maps: dict, permuted: dict, gather_donor
     return np.array(sorted(wall | added), np.int64), sorted(int(z) for z in added)
 
 
+def sample_support_closure(vs: VelocitySet, wall: np.ndarray, permuted: dict, direct_arm: np.ndarray) -> tuple:
+    """V2 (#2357): wall list := rule #253 UNION the sampler support (every cell of an S stencil), before the gradient map.
+
+    The wall-extrapolated reference reads S[L rho] and S[L u], so every sample cell needs a gradient; the native reader
+    (lbm.cpp 'a sample cell has no gradient') and the CPU reference (t87_model._rows 'a sample cell is not a wall-list cell')
+    refuse a container without it. A cell added here is outside rule #253, so it is pure: no gather entry, no return entry,
+    and every one of its states is a single unit transfer from the expected neighbour. As a donor it moves its whole cell,
+    so its direct arms are zero in exact geometry; in binary64 the polyhedron moments leave a residue (measured 8.9e-16 on
+    the four-layer flat channel). The residue is NOT snapped (direct_arm is computed before the wall list and keeps its
+    bytes); it is bounded here by ARM_ROUNDING (fail closed) and returned for the record. The gradient stencils do not depend
+    on the wall list (gradient_map: nearest fluid centroids of all cells), so the stencils of the other cells are unchanged.
+    Containers whose sample cells are all in rule #253 get no added cell and the same bytes as before."""
+    q = vs.q
+    support = np.unique(permuted["S"].tocsr().indices.astype(np.int64))
+    added = np.setdiff1d(support, wall)
+    arm_max = 0.0
+    if added.size:
+        donor_cell = permuted["D"].tocoo().col // q          # the entry order of arms() (the same permuted, sorted CSR)
+        if len(donor_cell) != len(direct_arm):
+            raise RuntimeError("INVALID: direct_arm and D have different entry counts")
+        of_added = np.isin(donor_cell, added)
+        arm_max = float(np.abs(direct_arm[of_added]).max())
+        if not arm_max <= ARM_ROUNDING:
+            raise B.GeometryRejected(f"INVALID: a sample-support cell outside rule #253 has a direct arm {arm_max!r} > "
+                                     f"{ARM_ROUNDING} (it is not a whole-cell donor)")
+    return np.union1d(wall, added).astype(np.int64), [int(z) for z in added], arm_max
+
+
+ARM_ROUNDING = 1e-12   # binary64 residue bound of a whole-cell direct arm (native ignores arms < 1e-9 only WITHOUT a gradient)
+
+
 # ---------------------------------------------------------------- the CLI (the only new code)
+class RoughTerrain:
+    """V2 (VOLUMETRIC_WALL_ROUGH): the facetwise rough law of the terrain facets, from the roughness length z0.
+    C = (kappa / ln(d / z0))^2 with kappa = 0.4 and d = 0.5 (the sample distance), the law of
+    research/wall_model/v2/rough_wall/e2/rough_model.py. Terrain facets ("T", ...) get (K0, C); lid facets ("L", ...) get
+    (0, 0): the lid stays a free-slip wall. Refused: z0 not finite or <= 0, d <= z0, a computed C that is not finite and
+    strictly positive, K0 not finite or < 0. d > z0 is a NECESSARY algebraic domain condition of the law (#2323); it is not
+    evidence that a physical sample lies in a log layer."""
+
+    KAPPA, SAMPLE_DISTANCE = 0.4, 0.5
+
+    def __init__(self, z0: float, K0: float) -> None:
+        if not (math.isfinite(z0) and z0 > 0.0):
+            raise ValueError(f"--rough-z0 must be finite and > 0 (it is {z0!r})")
+        if not self.SAMPLE_DISTANCE > z0:
+            raise ValueError(f"--rough-z0 {z0!r} >= the sample distance {self.SAMPLE_DISTANCE}: the log law needs the sample above the roughness")
+        if not (math.isfinite(K0) and K0 >= 0.0):
+            raise ValueError(f"--rough-K0 must be finite and >= 0 (it is {K0!r})")
+        self.z0, self.K0 = z0, K0
+        self.C = (self.KAPPA / math.log(self.SAMPLE_DISTANCE / z0)) ** 2
+        if not (math.isfinite(self.C) and self.C > 0.0):   # e.g. a subnormal z0: d/z0 overflows and C would silently be 0
+            raise ValueError(f"--rough-z0 {z0!r} gives C = {self.C!r}, not a finite positive coefficient")
+
+    def sections(self, facet_keys: list) -> tuple:
+        """(facet_friction facets x 2, facet_kind facets) in the container facet order."""
+        kinds = []
+        for key in facet_keys:
+            if not (isinstance(key, tuple) and len(key) > 0 and key[0] in ("T", "L")):
+                raise ValueError(f"facet key {key!r} is neither terrain ('T') nor lid ('L')")
+            kinds.append(0 if key[0] == "T" else 1)
+        kind = np.array(kinds, dtype=np.uint32)
+        law = np.zeros((len(facet_keys), 2))
+        law[kind == 0, 0], law[kind == 0, 1] = self.K0, self.C
+        return law, kind
+
+
 class ContainerBuild:
-    def __init__(self, manifest: TerrainManifest, velocities: str, nu: float, friction: float) -> None:
+    def __init__(self, manifest: TerrainManifest, velocities: str, nu: float, friction: float, rough: RoughTerrain | None = None,
+                 workers: int = 1) -> None:
         if not (math.isfinite(nu) and nu > 0.0 and math.isfinite(friction) and friction >= 0.0):
             raise ValueError("nu must be > 0 and K >= 0")
         self.manifest, self.vs, self.nu, self.friction = manifest, VelocitySet.named(velocities), nu, friction
+        self.rough = rough
+        self.initial_velocity = None  # task 107: None = the rest start f0 = w; (ux, uy, uz) = UniformStart (set by the caller)
+        if not (isinstance(workers, int) and workers >= 1):
+            raise ValueError("workers must be an integer >= 1")
+        self.workers = workers
         self.seconds = {}
+        self.support_added = []      # V2 (#2357): cells added to the wall list by sample_support_closure (set by build)
+        self.support_arm_max = 0.0
 
     def build(self, log) -> tuple:
         t0 = time.time()
@@ -603,11 +843,15 @@ class ContainerBuild:
             total = facets if kind == "facet" else cells
             if (n + 1) % max(1, total // 10) == 0 or n + 1 == total:
                 log(f"  {kind} pass {n + 1}/{total} {time.time() - start:.0f} s")
-        b.run(progress=progress)
+        if self.workers > 1:
+            b.run_parallel(record, self.workers, progress=progress)   # bitwise the serial result
+        else:
+            b.run(progress=progress)
         self.seconds["passes"] = time.time() - start
         t = time.time()
-        sam = B.build_sampler(b, stencil_weights)
+        sam = B.build_sampler(b, stencil_weights, NEIGHBOURS, visible_only=True)   # V2: exact window (#2213), 12 nearest VISIBLE (#2283)
         self.seconds["sampler"] = time.time() - t
+        log(f"sampler candidates: {sam['candidate_source']}")
         ident_maker = MapIdentities(self.vs)
         m = assemble(self.vs, b, sam)
         identities = ident_maker.identities(m)
@@ -620,6 +864,7 @@ class ContainerBuild:
         t = time.time()
         arm = arms(self.vs, b, m, p)
         wall, added = wall_list(self.vs, b, m, p, arm["wall_cells"])
+        wall, self.support_added, self.support_arm_max = sample_support_closure(self.vs, wall, p, arm["direct_arm"])   # V2 (#2357)
         grad = gradient_map(b.case, b, m["keys"], wall)
         self.seconds["arms_and_gradient"] = time.time() - t
         self.seconds["total"] = time.time() - t0
@@ -673,7 +918,10 @@ class ContainerBuild:
         for name in ("D", "G", "R", "S", "W"):
             w.csr(name, p[name])
         w.array("scalars", DTYPE_F64, np.array([self.nu, 1.0 / (3.0 * self.nu + 0.5), self.friction]))
-        w.array("f0", DTYPE_F64, np.tile(self.vs.w_array, len(keys)))
+        if self.initial_velocity is None:
+            w.array("f0", DTYPE_F64, np.tile(self.vs.w_array, len(keys)))
+        else:
+            w.array("f0", DTYPE_F64, UniformStart(self.vs).f0(len(keys), self.initial_velocity))
         w.array("s0", DTYPE_F64, p["s0"])
         arrays = {n: np.frombuffer(pl, {DTYPE_U32: "<u4", DTYPE_I32: "<i4", DTYPE_F64: "<f8"}[d]) for n, d, pl in w.sections if d != DTYPE_TEXT}
         phi0 = MapIdentities(self.vs).base_rows(arrays)
@@ -687,14 +935,26 @@ class ContainerBuild:
                 raise RuntimeError(f"INVALID: {name} does not fit uint32")
             w.sections.append((name, DTYPE_U32, grad[name].astype("<u4").tobytes()))
         w.sections.append(("gradient_weights", DTYPE_F64, np.ascontiguousarray(grad["gradient_weights"], "<f8").tobytes()))
+        if self.rough is not None:   # V2: the optional facetwise rough law; written only with --rough-z0 (legacy bytes otherwise)
+            law, kind = self.rough.sections(facet_keys)
+            w.array("facet_friction", DTYPE_F64, law.reshape(-1))
+            w.array("facet_kind", DTYPE_U32, kind)
         g = {k: v for k, v in grad.items() if not isinstance(v, np.ndarray)}
         prov = {"format": "VWNAT01", "case": record["name"], "velocity_set": self.vs.name, "Lx": case.Lx, "Ly": case.Ly,
                 "Z_top": case.Z_top, "z_lo": int(z_lo), "box": box.tolist(), "nu": self.nu, "friction_K": self.friction,
-                "f0": "rest w_i (rho0 = 1)", "s0": "W w_rd (rest prehistory)", "identities": identities, "gradient_report": g,
+                "f0": "rest w_i (rho0 = 1)" if self.initial_velocity is None else f"feq3(1, {list(self.initial_velocity)}) uniform",
+                "s0": "W w_rd (rest prehistory)", "identities": identities, "gradient_report": g,
                 "wall_list_cells_added_by_rule_253": len(added), "builder_diagnostics": b.diag.as_dict(),
                 "sampler_branches": sam["branches"], "exporter": "scripts/slip_wall/terrain_container.py",
                 "python": platform.python_version(), "numpy": np.__version__, "scipy": scipy.__version__,
                 "manifest_sha256": hashlib.sha256(json.dumps(record, sort_keys=True).encode("ascii")).hexdigest()}
+        if self.support_added:       # V2 (#2357): only when the closure adds a cell, so the legacy provenance text is unchanged
+            prov["wall_list_cells_added_by_sample_support"] = len(self.support_added)
+            prov["sample_support_direct_arm_max_abs"] = self.support_arm_max
+        if self.rough is not None:   # only with --rough-z0, so the legacy provenance text is unchanged
+            prov["rough"] = {"z0": self.rough.z0, "z0_hex": float(self.rough.z0).hex(), "K0_terrain": self.rough.K0,
+                             "C_terrain": self.rough.C, "C_terrain_hex": float(self.rough.C).hex(), "kappa": RoughTerrain.KAPPA,
+                             "sample_distance": RoughTerrain.SAMPLE_DISTANCE, "lid": "K0 = C = 0"}
         w.text("provenance", json.dumps(prov, indent=1))
         return w
 
@@ -758,12 +1018,40 @@ def main(argv: list) -> int:
     parser.add_argument("--velocities", default="D3Q27", choices=("D3Q27", "D3Q19"), help="D3Q19 only for the recovery control")
     parser.add_argument("--name", default="terrain")
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--rough-z0", type=float, default=None, help="V2: the terrain roughness length z0 (lattice units); writes the "
+                        "facet_friction and facet_kind sections (terrain (K0, C), lid (0, 0)); needs VOLUMETRIC_WALL_ROUGH to run")
+    parser.add_argument("--rough-K0", type=float, default=0.0, help="V2: the terrain K0 of the rough law (default 0)")
+    parser.add_argument("--allow-steep", action="store_true", help="V2: skip only the slope check R11 (|a|, |b| < 1); R10 and R1 stay. "
+                        "Slopes of 1 or more have unqualified wall-return accuracy; the steep geometry checks S8/S8X (S8X to slope 3.75) "
+                        "cover their own bounded inputs, not every steep terrain; the map identity gate still applies")
+    parser.add_argument("--workers", type=int, default=1, help="processes for the producer and donor passes (the container is "
+                        "the same, byte for byte, as with 1)")
+    parser.add_argument("--initial-velocity", default=None, help="V2: ux,uy,uz: f0 = feq3(1, u) in every cell (the uniform start of an "
+                        "open-x run, e.g. 0.05,0,0); default: the rest start f0 = w. s0 stays the rest prehistory")
     args = parser.parse_args(argv)
     if args.out.exists():
         print(f"REFUSED: {args.out} exists")
         return 2
+    rough = None
+    if args.rough_z0 is not None:
+        try:
+            rough = RoughTerrain(args.rough_z0, args.rough_K0)
+        except ValueError as error:
+            print(f"REFUSED: {error}")
+            return 2
+    elif args.rough_K0 != 0.0:
+        print("REFUSED: --rough-K0 needs --rough-z0")
+        return 2
     manifest = TerrainManifest.from_csv(args.heights, args.z_top, args.name)
-    run = ContainerBuild(manifest, args.velocities, args.nu, args.friction)
+    manifest.allow_steep = args.allow_steep
+    checks_run = "R10, R1 (R11 slope check skipped: --allow-steep)" if args.allow_steep else "R10, R11, R1"
+    run = ContainerBuild(manifest, args.velocities, args.nu, args.friction, rough, workers=args.workers)
+    if args.initial_velocity is not None:
+        try:
+            run.initial_velocity = UniformStart.parse(args.initial_velocity)
+        except ValueError as error:
+            print(f"REFUSED: {error}")
+            return 2
     lines = []
 
     def log(text):
@@ -774,7 +1062,7 @@ def main(argv: list) -> int:
     args.out.parent.mkdir(parents=True, exist_ok=True)   # the folder of the container or of the rejection report
     if not gate["passed"]:
         rejected = Path(str(args.out) + ".rejected.json")
-        gate.update({"container": None, "requested_output": str(args.out), "cells": len(m["keys"]), "rows": len(m["rows"]),
+        gate.update({"container": None, "allow_steep": args.allow_steep, "domain_checks": checks_run, "requested_output": str(args.out), "cells": len(m["keys"]), "rows": len(m["rows"]),
                      "builder_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                      "builder3d_sha256": hashlib.sha256(Path(B.__file__).read_bytes()).hexdigest()})
         rejected.write_text(json.dumps(gate, indent=1, default=str) + "\n", encoding="utf-8")
@@ -787,8 +1075,8 @@ def main(argv: list) -> int:
     writer.write(args.out)
     data = args.out.read_bytes()
     report = {"container": str(args.out), "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data), "velocity_set": run.vs.name,
-              "cells": len(m["keys"]), "facets": len(m["facet_keys"]), "rows": len(m["rows"]), "W_nnz": int(p["W"].nnz),
-              "identities": identities, "native_identities": gate["identities"], "seconds": run.seconds, "wall_list_cells_added_by_rule_253": added,
+              "allow_steep": args.allow_steep, "domain_checks": checks_run, "cells": len(m["keys"]), "facets": len(m["facet_keys"]), "rows": len(m["rows"]), "W_nnz": int(p["W"].nnz),
+              "identities": identities, "native_identities": gate["identities"], "seconds": run.seconds, "pass_workers": run.workers, "initial_velocity": run.initial_velocity, "wall_list_cells_added_by_rule_253": added,
               "builder_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               "builder3d_sha256": hashlib.sha256(Path(B.__file__).read_bytes()).hexdigest()}
     Path(str(args.out) + ".build.json").write_text(json.dumps(report, indent=1, allow_nan=False, default=str) + "\n", encoding="utf-8")
