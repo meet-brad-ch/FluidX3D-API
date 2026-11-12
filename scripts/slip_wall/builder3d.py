@@ -298,6 +298,7 @@ class Case:
             i, j = (int(s) for s in key.split(","))
             self.h_exact[(i, j)] = F(float.fromhex(txt)) if "/" not in txt else F(txt)
         self.diag = {tuple(int(s) for s in k.split(",")): v for k, v in record["diagonal"].items()}
+        self._tri_cache = {}
         for (i, j), hv in self.h_exact.items():
             if F(float(hv)) != hv:
                 raise GeometryRejected(f"node ({i}, {j}) is not exactly representable in binary64")
@@ -306,14 +307,21 @@ class Case:
         return self.h_exact[(i % self.Lx, j % self.Ly)]
 
     def triangles(self, i, j):
-        """(tag, exact vertices, float vertices) of the two triangles of column (i, j), unwrapped."""
+        """(tag, exact vertices, float vertices) of the two triangles of column (i, j), unwrapped.
+        Memoised per (i, j): the result depends only on the heightfield and the diagonal choice."""
+        key = (i, j)
+        cached = self._tri_cache.get(key)
+        if cached is not None:
+            return cached
         nd = {(a, b): self.hx(i + a, j + b) for a in (0, 1) for b in (0, 1)}
         P = lambda a, b: (F(i + a), F(j + b), nd[(a, b)])  # noqa: E731
         if self.diag[(i % self.Lx, j % self.Ly)] == "main":
             tris = [("T0", (P(0, 0), P(1, 0), P(1, 1))), ("T1", (P(0, 0), P(1, 1), P(0, 1)))]
         else:
             tris = [("T0", (P(0, 0), P(1, 0), P(0, 1))), ("T1", (P(1, 0), P(1, 1), P(0, 1)))]
-        return [(tag, tri, tuple(tuple(float(c) for c in p) for p in tri)) for tag, tri in tris]
+        result = [(tag, tri, tuple(tuple(float(c) for c in p) for p in tri)) for tag, tri in tris]
+        self._tri_cache[key] = result
+        return result
 
 
 def exact_plane(tri):
@@ -390,7 +398,7 @@ class Builder:
     def __init__(self, record: dict):
         self.case = Case(record)
         self.diag = Diag()
-        self.cells, self.facets, self._fcache = {}, {}, {}
+        self.cells, self.facets, self._fcache, self._fbase = {}, {}, {}, {}
         c = self.case
         zmin = math.floor(min(c.h_exact.values()))
         for i in range(c.Lx):
@@ -451,29 +459,20 @@ class Builder:
                 out.append(P)
         return out
 
-    def terrain_facets(self, i, j, k, origin=ORIGIN0):
-        """The terrain facets of column (i, j) (unwrapped) and layer k, in the frame of the integer origin (task 106).
-        The polygon is clipped in the facet's OWN frame (i, j, k) from the exact triangle; its projected area (P1: a
-        translated fan) and so the area vector a are therefore the same in every frame. The polygon is shifted into the
-        requested frame, and the plane offset of that frame comes from the exact triangle translated by -origin.
-        Keys, cells, the exact normal and the exact global offset d_raw_exact do not depend on the frame."""
-        key = (i, j, k, origin)
-        if origin == ORIGIN0:
-            cache = self._fcache
-        else:
-            if getattr(self, "_lorigin", None) != origin:   # a local frame: one small cache per origin (the passes keep one origin)
-                self._lorigin, self._lcache = origin, {}
-            cache = self._lcache
-        if key in cache:
-            return cache[key]
+    def _terrain_facets_base(self, i, j, k):
+        """The origin-independent half of the terrain facet computation for column (i, j), layer k.
+        Returns a list of tuples (key, ae, be, ge, part, g_own, axy, avec, unit, ln, a, b, cell_ijk)
+        that do not depend on the frame origin. Cached on (i, j, k) alone and never dropped."""
+        cached = self._fbase.get((i, j, k))
+        if cached is not None:
+            return cached
         out = []
         c = self.case
-        ox, oy, oz = origin
         for tag, tri, trif in c.triangles(i, j):
             ae, be, ge = exact_plane(tri)
             if ae == 0 and be == 0 and math.floor(ge) != k:
                 continue
-            own = shifted(tri, (i, j, k))                   # the facet's own frame: footprint in [0, 1]^2, layer z in [0, 1]
+            own = shifted(tri, (i, j, k))
             _, _, go = exact_plane(own)
             a, b, g_own = float(ae), float(be), float(go)
             foot = [(float(p[0]), float(p[1])) for p in own]
@@ -484,15 +483,40 @@ class Builder:
             part = polygon_clip2(part, (-a, -b), g_own) if part is not None else None
             if part is None:
                 continue
-            axy = translated_fan_area(part)                 # task 106 P1
+            axy = translated_fan_area(part)
             n_raw = (-a, -b, 1.0)
             avec = (axy * n_raw[0], axy * n_raw[1], axy * n_raw[2])
             ln = math.sqrt(dotf(n_raw, n_raw))
             unit = (n_raw[0] / ln, n_raw[1] / ln, n_raw[2] / ln)
+            fkey = ("T", i % c.Lx, j % c.Ly, tag, k)
+            cell_ijk = (i % c.Lx, j % c.Ly, k)
+            out.append((fkey, ae, be, ge, part, g_own, axy, avec, unit, ln, a, b, cell_ijk))
+        self._fbase[(i, j, k)] = out
+        return out
+
+    def terrain_facets(self, i, j, k, origin=ORIGIN0):
+        """The terrain facets of column (i, j) (unwrapped) and layer k, in the frame of the integer origin (task 106).
+        The polygon is clipped in the facet's OWN frame (i, j, k) from the exact triangle; its projected area (P1: a
+        translated fan) and so the area vector a are therefore the same in every frame. The polygon is shifted into the
+        requested frame, and the plane offset of that frame comes from the exact triangle translated by -origin.
+        Keys, cells, the exact normal and the exact global offset d_raw_exact do not depend on the frame."""
+        key = (i, j, k, origin)
+        if origin == ORIGIN0:
+            cache = self._fcache
+        else:
+            if getattr(self, "_lorigin", None) != origin:
+                self._lorigin, self._lcache = origin, {}
+            cache = self._lcache
+        if key in cache:
+            return cache[key]
+        base = self._terrain_facets_base(i, j, k)
+        ox, oy, oz = origin
+        out = []
+        for fkey, ae, be, ge, part, g_own, axy, avec, unit, ln, a, b, cell_ijk in base:
             dx, dy, dz = float(i - ox), float(j - oy), float(k - oz)
             poly = [(p[0] + dx, p[1] + dy, a * p[0] + b * p[1] + g_own + dz) for p in part]
-            _, _, g_frame = exact_plane(shifted(tri, origin))
-            out.append(Facet(("T", i % c.Lx, j % c.Ly, tag, k), poly, (-ae, -be, F(1)), avec, unit, (i % c.Lx, j % c.Ly, k),
+            g_frame = ge + ae * ox + be * oy - oz
+            out.append(Facet(fkey, poly, (-ae, -be, F(1)), avec, unit, cell_ijk,
                              (unit, float(g_frame) / ln), ge))
         cache[key] = out
         return out
