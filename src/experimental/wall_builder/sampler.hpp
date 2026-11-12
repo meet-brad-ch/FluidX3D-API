@@ -111,11 +111,16 @@ private:
     int limit_{};
     int kmin_{};
     int nk_{};
-    std::vector<int> cell_index_{};          ///< Cell index per (i, j, k - kmin), -1 for none.
     std::vector<FacetSample> samples_{};
     std::vector<FacetCounters> facet_counters_{};
 
     void search(std::size_t facet, FacetSample& sample, FacetCounters& counters) const;
+    /// @brief True when every cell centroid lies in its unit cell (then the index windows of the search are exact).
+    [[nodiscard]] bool centroids_contained() const;
+    /// @brief cell <= value <= cell + 1.
+    [[nodiscard]] static bool inside(double value, int cell);
+    /// @brief True when every unwrapped index in [first, last] lies in one of the images -n, 0, n of a periodic axis of n.
+    [[nodiscard]] static bool three_images(int first, int last, int n);
     [[nodiscard]] static Vec3 area_centroid(const Facet& f);
     [[nodiscard]] SamplerCandidate candidate(const Vec3& xs, int index, int sx, int sy) const;
     [[nodiscard]] bool window(const Vec3& xs, int m, std::vector<SamplerCandidate>& out) const;

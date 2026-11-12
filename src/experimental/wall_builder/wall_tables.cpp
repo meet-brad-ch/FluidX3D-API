@@ -42,12 +42,8 @@ WallTables::WallTables(const TerrainGeometry& geometry, const VelocityTable& vel
     , velocities_{ velocities }
     , assembly_{ assembly }
 {
-    kmin_ = std::numeric_limits<int>::max();
-    kmax_ = std::numeric_limits<int>::min();
-    for (const TerrainCell& cell : geometry.cells()) {
-        kmin_ = std::min(kmin_, cell.ijk[2]);
-        kmax_ = std::max(kmax_, cell.ijk[2]);
-    }
+    kmin_ = geometry.lowest_layer();
+    kmax_ = geometry.record().z_top - 1;
 }
 
 // ------------------------------------------------------------------------------------------------ arms
@@ -55,115 +51,52 @@ WallTables::WallTables(const TerrainGeometry& geometry, const VelocityTable& vel
 ArmTables WallTables::arms(const AssembledMaps& m, const PermutedMaps& p) const
 {
     const auto q{ static_cast<std::int64_t>(velocities_.directions.size()) };
-    const std::vector<TerrainCell>& cells{ geometry_.cells() };
     ArmTables out{};
-    // direct_arm: np.array(part[1:]) / part[0] - centroid_local[cell], per D entry in CSR order
-    for (const std::int64_t column : p.d.indices) {
-        const auto cell{ static_cast<std::size_t>(column / q) };
-        const auto d{ static_cast<std::size_t>(column % q) };
-        const std::array<double, 4>& part{ assembly_.passes().cell_results()[cell][d].direct[0].moment };
-        const Vec3& local{ cells[cell].centroid_local };
-        out.direct_arm.push_back(part[1] / part[0] - local.x);
-        out.direct_arm.push_back(part[2] / part[0] - local.y);
-        out.direct_arm.push_back(part[3] / part[0] - local.z);
-    }
-    std::vector<char> gather_cells(cells.size(), 0);
+    std::vector<std::int64_t> gather_cells{};
     for (std::int64_t row{ 0 }; row < p.g.rows; ++row) {
         const WallRow& origin{ m.rows[static_cast<std::size_t>(p.order[static_cast<std::size_t>(row)])] };
-        const UnitResult* unit{ assembly_.producer_unit(origin.facet, origin.direction) };
+        const ProducerRowView unit{ assembly_.producer_unit(origin.facet, origin.direction) };
         for (std::int64_t e{ p.g.offsets[static_cast<std::size_t>(row)] }; e < p.g.offsets[static_cast<std::size_t>(row) + 1u]; ++e) {
             const std::int64_t column{ p.g.indices[static_cast<std::size_t>(e)] };
             const auto cell{ static_cast<std::size_t>(column / q) };
             if (column % q != velocities_.opposites[static_cast<std::size_t>(origin.direction)]) {
                 throw std::runtime_error("INVALID: a gather entry is not the opposite direction of its row");
             }
-            const auto found{ std::find_if(unit->h_moment.begin(), unit->h_moment.end(), [&](const HMomentEntry& h) { return h.cell == cells[cell].ijk; }) };
-            if (found == unit->h_moment.end()) {
-                throw std::runtime_error("INVALID: no h_moment for a gather entry of cell " + cell_text(cells[cell].ijk));
+            const std::array<int, 3> ijk{ geometry_.cell_ijk(cell) };
+            const auto found{ std::find_if(unit.moments.begin(), unit.moments.end(), [&](const HMoment& h) { return h.cell == ijk; }) };
+            if (found == unit.moments.end()) {
+                throw std::runtime_error("INVALID: no h_moment for a gather entry of cell " + cell_text(ijk));
             }
-            const Vec3& local{ cells[cell].centroid_local };
+            const Vec3& local{ geometry_.cell_local(cell) };
             out.prism_arm.push_back(found->value[1] / found->value[0] - local.x);
             out.prism_arm.push_back(found->value[2] / found->value[0] - local.y);
             out.prism_arm.push_back(found->value[3] / found->value[0] - local.z);
-            gather_cells[cell] = 1;
+            gather_cells.push_back(static_cast<std::int64_t>(cell));
         }
     }
-    for (std::size_t cell{ 0 }; cell < gather_cells.size(); ++cell) {
-        if (gather_cells[cell] != 0) {
-            out.wall_cells.push_back(static_cast<std::int64_t>(cell));
-        }
-    }
+    std::sort(gather_cells.begin(), gather_cells.end());
+    gather_cells.erase(std::unique(gather_cells.begin(), gather_cells.end()), gather_cells.end());
+    out.wall_cells = std::move(gather_cells);
     return out;
 }
 
 // ------------------------------------------------------------------------------------------------ wall list
 
-WallList WallTables::wall_list(const PermutedMaps& p, const ArmTables& arms) const
+WallList WallTables::wall_list(const std::vector<char>& wall, const SlabResults& stream, const SparseMatrix& s,
+                               const std::vector<std::int64_t>& support) const
 {
-    const TerrainRecord& record{ geometry_.record() };
-    const auto q{ static_cast<std::int64_t>(velocities_.directions.size()) };
-    const std::size_t cells{ geometry_.cells().size() };
-    // per-cell flags in place of Python's sets: their sorted lists are the flagged indices in order
-    std::vector<char> wall(cells, 0);
-    for (const std::int64_t cell : arms.wall_cells) {
-        wall[static_cast<std::size_t>(cell)] = 1;
-    }
-    std::vector<char> added(cells, 0);
-    for (std::int64_t state{ 0 }; state < p.d.rows; ++state) {
-        const std::int64_t cell{ state / q };
-        const auto d{ static_cast<std::size_t>(state % q) };
-        const std::int64_t a{ p.d.offsets[static_cast<std::size_t>(state)] };
-        const std::int64_t b{ p.d.offsets[static_cast<std::size_t>(state) + 1u] };
-        const Direction& c{ velocities_.directions[d] };
-        const std::array<int, 3>& k{ geometry_.cells()[static_cast<std::size_t>(cell)].ijk };
-        const std::int64_t expected{ assembly_.cell_index(TerrainGeometry::wrap(k[0] - c.x, record.lx), TerrainGeometry::wrap(k[1] - c.y, record.ly), k[2] - c.z) };
-        const bool no_return{ p.r.offsets[static_cast<std::size_t>(state) + 1u] == p.r.offsets[static_cast<std::size_t>(state)] };
-        const bool pure{ b - a == 1 && p.d.values[static_cast<std::size_t>(a)] == 1.0 && expected >= 0
-                         && p.d.indices[static_cast<std::size_t>(a)] == expected * q + static_cast<std::int64_t>(d) && no_return };
-        if (pure) {
-            continue;
-        }
-        if (wall[static_cast<std::size_t>(cell)] == 0) {
-            added[static_cast<std::size_t>(cell)] = 1;
-        }
-        for (std::int64_t e{ a }; e < b; ++e) {
-            const auto donor{ static_cast<std::size_t>(p.d.indices[static_cast<std::size_t>(e)] / q) };
-            if (wall[donor] == 0) {
-                added[donor] = 1;
-            }
-        }
-    }
+    const std::size_t cells{ geometry_.cell_count() };
     WallList out{};
+    // per-cell flags in place of Python's sets: their sorted lists are the flagged indices in order
     std::vector<char> all(cells, 0);
     for (std::size_t cell{ 0 }; cell < cells; ++cell) {
-        all[cell] = static_cast<char>(wall[cell] != 0 || added[cell] != 0);
-        if (added[cell] != 0) {
+        const bool listed{ wall[cell] != 0 || stream.added[cell] != 0 };
+        all[cell] = static_cast<char>(listed);
+        if (stream.added[cell] != 0) {
             out.added_253.push_back(static_cast<std::int64_t>(cell));
         }
     }
-    // sample_support_closure: every S stencil cell needs a gradient
-    std::vector<char> extra(cells, 0);
-    bool any_extra{ false };
-    for (const std::int64_t cell : p.s.indices) {
-        if (all[static_cast<std::size_t>(cell)] == 0) {
-            extra[static_cast<std::size_t>(cell)] = 1;
-            any_extra = true;
-        }
-    }
-    if (any_extra) {
-        for (std::size_t e{ 0 }; e < p.d.indices.size(); ++e) {
-            if (extra[static_cast<std::size_t>(p.d.indices[e] / q)] == 0) {
-                continue;
-            }
-            for (std::size_t k{ 0 }; k < 3; ++k) {
-                out.support_arm_max = std::max(out.support_arm_max, std::fabs(arms.direct_arm[3 * e + k]));
-            }
-        }
-        if (!(out.support_arm_max <= ARM_ROUNDING)) {
-            throw std::runtime_error("INVALID: a sample-support cell outside rule #253 has a direct arm " + PythonFloat::repr(out.support_arm_max)
-                                     + " > 1e-12 (it is not a whole-cell donor)");
-        }
-    }
+    const std::vector<char> extra{ support_closure(all, stream, s, support, out) };
     for (std::size_t cell{ 0 }; cell < cells; ++cell) {
         if (extra[cell] != 0) {
             out.added_support.push_back(static_cast<std::int64_t>(cell));
@@ -175,13 +108,41 @@ WallList WallTables::wall_list(const PermutedMaps& p, const ArmTables& arms) con
     return out;
 }
 
+std::vector<char> WallTables::support_closure(const std::vector<char>& all, const SlabResults& stream, const SparseMatrix& s,
+                                              const std::vector<std::int64_t>& support, WallList& out) const
+{
+    // sample_support_closure: every S stencil cell needs a gradient
+    std::vector<char> extra(all.size(), 0);
+    bool any_extra{ false };
+    for (const std::int64_t cell : s.indices) {
+        if (all[static_cast<std::size_t>(cell)] == 0) {
+            extra[static_cast<std::size_t>(cell)] = 1;
+            any_extra = true;
+        }
+    }
+    if (!any_extra) {
+        return extra;
+    }
+    // the largest |direct arm| over the D entries of the extra cells (the stream kept it per support cell)
+    for (std::size_t n{ 0 }; n < support.size(); ++n) {
+        if (extra[static_cast<std::size_t>(support[n])] != 0) {
+            out.support_arm_max = std::max(out.support_arm_max, stream.support_arm[n]);
+        }
+    }
+    if (!(out.support_arm_max <= ARM_ROUNDING)) {
+        throw std::runtime_error("INVALID: a sample-support cell outside rule #253 has a direct arm " + PythonFloat::repr(out.support_arm_max)
+                                 + " > 1e-12 (it is not a whole-cell donor)");
+    }
+    return extra;
+}
+
 // ------------------------------------------------------------------------------------------------ gradient map
 
 std::array<double, 3> WallTables::image_delta(const std::int64_t cell, const int shift, const std::int64_t a) const
 {
     const TerrainRecord& record{ geometry_.record() };
-    const Vec3& c{ geometry_.cells()[static_cast<std::size_t>(cell)].centroid };
-    const Vec3& own{ geometry_.cells()[static_cast<std::size_t>(a)].centroid };
+    const Vec3& c{ geometry_.cell_centroid(static_cast<std::size_t>(cell)) };
+    const Vec3& own{ geometry_.cell_centroid(static_cast<std::size_t>(a)) };
     const double sx{ static_cast<double>((shift / 3 - 1) * record.lx) };
     const double sy{ static_cast<double>((shift % 3 - 1) * record.ly) };
     // centroid[cell] + shifts[shift] - centroid[a]
@@ -191,7 +152,7 @@ std::array<double, 3> WallTables::image_delta(const std::int64_t cell, const int
 void WallTables::window_points(const std::int64_t a, const int m, std::vector<ImagePoint>& out) const
 {
     const TerrainRecord& record{ geometry_.record() };
-    const std::array<int, 3>& own{ geometry_.cells()[static_cast<std::size_t>(a)].ijk };
+    const std::array<int, 3> own{ geometry_.cell_ijk(static_cast<std::size_t>(a)) };
     out.clear();
     for (int big_i{ own[0] - m }; big_i <= own[0] + m; ++big_i) {
         const int i{ TerrainGeometry::wrap(big_i, record.lx) };
@@ -225,7 +186,7 @@ std::vector<WallTables::ImagePoint> WallTables::nearest_points(const std::int64_
     // cKDTree.query(k=QUERY) over the 9 images: an index window of half width m holds every point with d2 < m^2 (each
     // centroid lies in its unit cell), so its QUERY nearest are exact once the QUERY-th has d2 < m^2
     const TerrainRecord& record{ geometry_.record() };
-    const auto points{ static_cast<std::int64_t>(geometry_.cells().size()) * 9 };
+    const auto points{ static_cast<std::int64_t>(geometry_.cell_count()) * 9 };
     const auto wanted{ static_cast<std::size_t>(std::min<std::int64_t>(QUERY, points)) };
     const int whole{ std::max({ 3 * record.lx, 3 * record.ly, kmax_ - kmin_ + 1 }) };
     std::vector<ImagePoint> found{};
@@ -325,7 +286,7 @@ WallTables::CellStencil WallTables::stencil(const std::int64_t a) const
     }
     const Matrix normal{ DenseAlgebra::gram(basis) };
     if (DenseAlgebra::rank(basis) < 4) {
-        throw std::runtime_error("gradient stencil of cell " + cell_text(geometry_.cells()[static_cast<std::size_t>(a)].ijk) + ": rank < 4");
+        throw std::runtime_error("gradient stencil of cell " + cell_text(geometry_.cell_ijk(static_cast<std::size_t>(a))) + ": rank < 4");
     }
     Matrix transposed{ 4, count, std::vector<double>(basis.data.size(), 0.0) };
     for (int r{ 0 }; r < count; ++r) {

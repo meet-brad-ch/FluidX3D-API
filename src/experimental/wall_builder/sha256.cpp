@@ -8,6 +8,7 @@
 
 #include <bcrypt.h>
 
+#include <algorithm>
 #include <array>
 #include <stdexcept>
 
@@ -46,28 +47,6 @@ std::string hex_text(const std::array<unsigned char, 32>& hash)
 
 } // namespace
 
-std::string Sha256::of(const std::vector<std::vector<char>>& chunks)
-{
-    const Algorithm algorithm{};
-    BCRYPT_HASH_HANDLE handle{ nullptr };
-    if (BCryptCreateHash(algorithm.handle, &handle, nullptr, 0, nullptr, 0, 0) < 0) {
-        throw std::runtime_error("BCryptCreateHash failed");
-    }
-    bool ok{ true };
-    for (const std::vector<char>& chunk : chunks) {
-        // BCryptHashData takes a non-const input pointer but does not change the input
-        auto* const data{ reinterpret_cast<unsigned char*>(const_cast<char*>(chunk.data())) };
-        ok = ok && BCryptHashData(handle, data, static_cast<unsigned long>(chunk.size()), 0) >= 0;
-    }
-    std::array<unsigned char, 32> hash{};
-    ok = ok && BCryptFinishHash(handle, hash.data(), 32, 0) >= 0;
-    BCryptDestroyHash(handle);
-    if (!ok) {
-        throw std::runtime_error("BCryptHashData failed");
-    }
-    return hex_text(hash);
-}
-
 std::string Sha256::digest(const unsigned char* const data, const unsigned long size)
 {
     const Algorithm algorithm{};
@@ -88,6 +67,63 @@ std::string Sha256::of(const std::string& bytes)
 std::string Sha256::of(const std::vector<char>& bytes)
 {
     return digest(reinterpret_cast<const unsigned char*>(bytes.data()), static_cast<unsigned long>(bytes.size()));
+}
+
+// ------------------------------------------------------------------------------------------------ Sha256Stream
+
+Sha256Stream::Sha256Stream()
+{
+    BCRYPT_ALG_HANDLE algorithm{ nullptr };
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0) {
+        throw std::runtime_error("BCryptOpenAlgorithmProvider(SHA256) failed");
+    }
+    algorithm_ = algorithm;
+    BCRYPT_HASH_HANDLE hash{ nullptr };
+    if (BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0) < 0) {
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        throw std::runtime_error("BCryptCreateHash failed");
+    }
+    hash_ = hash;
+}
+
+Sha256Stream::~Sha256Stream()
+{
+    if (hash_ != nullptr) {
+        BCryptDestroyHash(static_cast<BCRYPT_HASH_HANDLE>(hash_));
+    }
+    BCryptCloseAlgorithmProvider(static_cast<BCRYPT_ALG_HANDLE>(algorithm_), 0);
+}
+
+void Sha256Stream::update(const char* const data, const std::size_t size)
+{
+    if (hash_ == nullptr) {
+        throw std::logic_error("Sha256Stream: update after finish");
+    }
+    // BCryptHashData takes a non-const input pointer and an unsigned long size; it does not change the input
+    std::size_t done{ 0 };
+    while (done < size) {
+        const std::size_t part{ std::min<std::size_t>(size - done, std::size_t{ 1 } << 30) };
+        auto* const bytes{ reinterpret_cast<unsigned char*>(const_cast<char*>(data + done)) };
+        if (BCryptHashData(static_cast<BCRYPT_HASH_HANDLE>(hash_), bytes, static_cast<unsigned long>(part), 0) < 0) {
+            throw std::runtime_error("BCryptHashData failed");
+        }
+        done += part;
+    }
+}
+
+std::string Sha256Stream::finish()
+{
+    if (hash_ == nullptr) {
+        throw std::logic_error("Sha256Stream: finish twice");
+    }
+    std::array<unsigned char, 32> digest{};
+    const NTSTATUS status{ BCryptFinishHash(static_cast<BCRYPT_HASH_HANDLE>(hash_), digest.data(), 32, 0) };
+    BCryptDestroyHash(static_cast<BCRYPT_HASH_HANDLE>(hash_));
+    hash_ = nullptr;
+    if (status < 0) {
+        throw std::runtime_error("BCryptFinishHash failed");
+    }
+    return hex_text(digest);
 }
 
 } // namespace fluidx3d::experimental::wall_builder

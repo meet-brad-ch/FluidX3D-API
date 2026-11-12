@@ -7,6 +7,7 @@
 #include "poly.hpp"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -89,7 +90,7 @@ struct ColumnTrianglePlane {
     double g{};                   ///< float(g) at the unwrapped position.
 };
 
-/// @brief One fluid cell and its pieces in its own frame.
+/// @brief One fluid cell with its pieces in its own frame (made on demand for the donor pass; not stored for all cells).
 struct TerrainCell {
     std::array<int, 3> ijk{};   ///< The cell.
     std::vector<Poly> pieces{}; ///< The fluid pieces, frame origin (i, j, k).
@@ -103,14 +104,48 @@ class TerrainGeometry {
 public:
     /// @brief Builds every cell, the canonical facets and the facet bases of all columns a pass can ask for.
     /// @throws std::runtime_error with the builder's message when a cell is classified fluid but has no piece
-    /// @throws std::domain_error when an input value is outside what the port supports
-    explicit TerrainGeometry(TerrainRecord record);
+    /// @throws std::domain_error when an input value is outside what the port supports, or no cell is fluid
+    /// @throws std::invalid_argument when threads is below 1
+    /// @param threads the number of threads of the parallel set-up, 1 or more
+    TerrainGeometry(TerrainRecord record, int threads);
 
     /// @brief The input record.
     [[nodiscard]] const TerrainRecord& record() const { return record_; }
 
-    /// @brief The fluid cells, sorted as Python's sorted() of (i, j, k) tuples.
-    [[nodiscard]] const std::vector<TerrainCell>& cells() const { return cells_; }
+    /// @brief The number of fluid cells. Cell n is the n-th in Python's sorted() of (i, j, k) tuples.
+    [[nodiscard]] std::size_t cell_count() const { return volume_.size(); }
+
+    /// @brief The (i, j, k) of cell n.
+    [[nodiscard]] std::array<int, 3> cell_ijk(std::size_t n) const;
+
+    /// @brief The fluid volume of cell n (Builder.__init__ "volume").
+    [[nodiscard]] double cell_volume(const std::size_t n) const { return volume_[n]; }
+
+    /// @brief The fluid centroid of cell n in global coordinates ("centroid").
+    [[nodiscard]] const Vec3& cell_centroid(const std::size_t n) const { return centroid_[n]; }
+
+    /// @brief The centroid of cell n about its corner ("centroid_local").
+    [[nodiscard]] const Vec3& cell_local(const std::size_t n) const { return local_[n]; }
+
+    /// @brief The index of fluid cell (i, j, k), i and j wrapped into the box, k as is; -1 when it is not a fluid cell.
+    [[nodiscard]] std::int64_t cell_index(int i, int j, int k) const;
+
+    /// @brief The index of the first cell of x-column i; column_first(lx) is the cell count. The cells of x-columns
+    /// [a, b) are the indices [column_first(a), column_first(b)).
+    [[nodiscard]] std::size_t column_first(const int i) const { return static_cast<std::size_t>(first_[static_cast<std::size_t>(i) * static_cast<std::size_t>(record_.ly)]); }
+
+    /// @brief The lowest layer k of a fluid cell; the highest is z_top - 1.
+    [[nodiscard]] int lowest_layer() const { return lowest_layer_; }
+
+    /// @brief The first fluid layer of column (i, j), i and j inside the box; z_top when the column has no cell.
+    [[nodiscard]] int first_layer(const int i, const int j) const { return kfirst_[static_cast<std::size_t>(i) * static_cast<std::size_t>(record_.ly) + static_cast<std::size_t>(j)]; }
+
+    /// @brief The index of the first cell of column (i, j), i and j inside the box.
+    [[nodiscard]] std::size_t column_cell(const int i, const int j) const { return static_cast<std::size_t>(first_[static_cast<std::size_t>(i) * static_cast<std::size_t>(record_.ly) + static_cast<std::size_t>(j)]); }
+
+    /// @brief Cell n with its pieces and their cached volumes and moments, for the donor pass.
+    /// @throws std::runtime_error when the cell has no piece
+    [[nodiscard]] TerrainCell donor_cell(std::size_t n) const;
 
     /// @brief The canonical facets (frame origin 0), sorted by Python's str() of the key.
     [[nodiscard]] const std::vector<Facet>& facets() const { return facets_; }
@@ -137,7 +172,9 @@ public:
 
 private:
     TerrainRecord record_{};
-    int zmin_{};                           ///< floor of the lowest node height.
+    int threads_{ 1 };                     ///< Threads of the parallel set-up.
+    int zmin_{};
+    int lowest_layer_{ 2147483647 };       ///< The lowest fluid layer (INT_MAX until the column index is built).                           ///< floor of the lowest node height.
     int base_i0_{};                        ///< Lowest unwrapped column x of the base table.
     int base_j0_{};                        ///< Lowest unwrapped column y.
     int base_k0_{};                        ///< Lowest layer.
@@ -145,7 +182,11 @@ private:
     int base_nj_{};                        ///< Columns y.
     int base_nk_{};                        ///< Layers.
     std::vector<std::vector<FacetBase>> bases_{}; ///< Facet bases per (i, j, k) of the table.
-    std::vector<TerrainCell> cells_{};
+    std::vector<int> kfirst_{};             ///< Per column (i * ly + j): the first fluid layer.
+    std::vector<std::int64_t> first_{};     ///< Per column: the index of its first cell; one more entry: the cell count.
+    std::vector<double> volume_{};          ///< Per cell.
+    std::vector<Vec3> centroid_{};          ///< Per cell.
+    std::vector<Vec3> local_{};             ///< Per cell.
     std::vector<Facet> facets_{};
 
     [[nodiscard]] double height_value(int i, int j) const;
@@ -156,9 +197,12 @@ private:
     /// sums of the piece volumes and moments.
     static void cell_moments(TerrainCell& cell, bool full);
     [[nodiscard]] Facet facet_from_base(const FacetBase& base, int i, int j, int k, const std::array<int, 3>& origin) const;
-    void build_cells_and_facets();
-    /// @brief The cells and canonical facets of one column, in Builder.__init__ order.
-    void build_column(int i, int j, std::vector<TerrainCell>& cells, std::vector<Facet>& facets) const;
+    /// @brief Per column the first fluid layer (k + 1 > the lowest node, Builder.__init__) and the cell offsets.
+    void build_column_index();
+    /// @brief Volume, centroid and local centroid of every cell, on all threads; the pieces are not kept.
+    void build_cells();
+    /// @brief The canonical facets of every fluid cell and the lids, sorted by Python's str() of the key.
+    void build_facets();
     void build_base_table();
 };
 

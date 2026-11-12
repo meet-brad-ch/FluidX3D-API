@@ -3,15 +3,16 @@
 /// @brief The wall tables of terrain_container.py: arms, wall_list, sample_support_closure and gradient_map.
 
 #include "maps.hpp"
+#include "slab_stream.hpp"
 
 #include <cstdint>
 #include <vector>
 
 namespace fluidx3d::experimental::wall_builder {
 
-/// @brief arms(): the part centroid minus the cell's fluid centroid, per permuted D and G entry.
+/// @brief arms(): the part centroid minus the cell's fluid centroid, per permuted G entry (the D part, direct_arm, is
+/// made by the slab stream).
 struct ArmTables {
-    std::vector<double> direct_arm{};          ///< 3 per D entry.
     std::vector<double> prism_arm{};           ///< 3 per G entry.
     std::vector<std::int64_t> wall_cells{};    ///< Sorted unique gather donor cells.
 };
@@ -43,12 +44,18 @@ class WallTables {
 public:
     WallTables(const TerrainGeometry& geometry, const VelocityTable& velocities, const MapAssembly& assembly);
 
-    /// @brief arms(vs, b, m, p). @throws std::runtime_error for a gather entry that is not the opposite direction of its row
+    /// @brief The G part of arms(vs, b, m, p).
+    /// @throws std::runtime_error for a gather entry that is not the opposite direction of its row, or without h_moment
     [[nodiscard]] ArmTables arms(const AssembledMaps& m, const PermutedMaps& p) const;
 
-    /// @brief wall_list and sample_support_closure.
+    /// @brief wall_list and sample_support_closure, from the stream's rule #253 flags.
+    /// @param wall per cell: 1 for a gather donor cell
+    /// @param stream the slab stream's results (added cells, direct arms of the support cells)
+    /// @param s the permuted S
+    /// @param support the S stencil cells, sorted unique (the order of stream.support_arm)
     /// @throws std::runtime_error when an added support cell has a direct arm above 1e-12
-    [[nodiscard]] WallList wall_list(const PermutedMaps& p, const ArmTables& arms) const;
+    [[nodiscard]] WallList wall_list(const std::vector<char>& wall, const SlabResults& stream, const SparseMatrix& s,
+                                     const std::vector<std::int64_t>& support) const;
 
     /// @brief gradient_map on all threads. @throws std::runtime_error with the builder's message for a bad stencil
     [[nodiscard]] GradientMap gradient(const std::vector<std::int64_t>& wall_cells, int threads) const;
@@ -83,6 +90,10 @@ private:
     int kmax_{};
 
     [[nodiscard]] CellStencil stencil(std::int64_t a) const;
+    /// @brief sample_support_closure: per cell, 1 for an S stencil cell outside the wall list; sets out.support_arm_max.
+    /// @throws std::runtime_error when such a cell has a direct arm above 1e-12
+    [[nodiscard]] std::vector<char> support_closure(const std::vector<char>& all, const SlabResults& stream, const SparseMatrix& s,
+                                                    const std::vector<std::int64_t>& support, WallList& out) const;
     [[nodiscard]] std::vector<ImagePoint> nearest_points(std::int64_t a) const;
     void window_points(std::int64_t a, int m, std::vector<ImagePoint>& out) const;
     [[nodiscard]] std::array<double, 3> image_delta(std::int64_t cell, int shift, std::int64_t a) const;

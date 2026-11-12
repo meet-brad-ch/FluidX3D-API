@@ -155,29 +155,48 @@ SamplerSearch::SamplerSearch(const TerrainGeometry& geometry, const int neighbou
     , neighbours_{ neighbours }
 {
     const TerrainRecord& record{ geometry.record() };
-    const std::vector<TerrainCell>& cells{ geometry.cells() };
-    int kmax{ std::numeric_limits<int>::min() };
-    kmin_ = std::numeric_limits<int>::max();
-    contained_ = true;
-    for (const TerrainCell& cell : cells) {
-        kmin_ = std::min(kmin_, cell.ijk[2]);
-        kmax = std::max(kmax, cell.ijk[2]);
-        const std::array<double, 3> ce{ cell.centroid.x, cell.centroid.y, cell.centroid.z };
-        for (std::size_t a{ 0 }; a < 3; ++a) {
-            const auto k{ static_cast<double>(cell.ijk[a]) };
-            contained_ = contained_ && k <= ce[a] && ce[a] <= k + 1;
-        }
-    }
-    const int layers{ cells.empty() ? 1 : kmax - kmin_ + 1 };
+    kmin_ = geometry.lowest_layer();
+    const int layers{ record.z_top - kmin_ };
     limit_ = std::max({ record.lx, record.ly, layers });
     nk_ = layers;
-    cell_index_.assign(static_cast<std::size_t>(record.lx) * static_cast<std::size_t>(record.ly) * static_cast<std::size_t>(nk_), -1);
-    for (std::size_t n{ 0 }; n < cells.size(); ++n) {
-        const std::array<int, 3>& c{ cells[n].ijk };
-        const std::size_t slot{ (static_cast<std::size_t>(c[0]) * static_cast<std::size_t>(record.ly) + static_cast<std::size_t>(c[1])) * static_cast<std::size_t>(nk_)
-                                + static_cast<std::size_t>(c[2] - kmin_) };
-        cell_index_[slot] = static_cast<int>(n);
+    if (geometry.cell_count() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::domain_error("SamplerSearch: " + std::to_string(geometry.cell_count()) + " cells do not fit its int cell index");
     }
+    contained_ = centroids_contained();
+}
+
+bool SamplerSearch::centroids_contained() const
+{
+    const TerrainRecord& record{ geometry_.record() };
+    bool contained{ true };
+    for (int i{ 0 }; i < record.lx; ++i) {
+        for (int j{ 0 }; j < record.ly; ++j) {
+            const int k_first{ geometry_.first_layer(i, j) };
+            const std::size_t n_first{ geometry_.column_cell(i, j) };
+            for (int k{ k_first }; k < record.z_top; ++k) {
+                const Vec3& ce{ geometry_.cell_centroid(n_first + static_cast<std::size_t>(k - k_first)) };
+                contained = contained && inside(ce.x, i) && inside(ce.y, j) && inside(ce.z, k);
+            }
+        }
+    }
+    return contained;
+}
+
+bool SamplerSearch::inside(const double value, const int cell)
+{
+    const auto low{ static_cast<double>(cell) };
+    return low <= value && value <= low + 1;
+}
+
+bool SamplerSearch::three_images(const int first, const int last, const int n)
+{
+    for (int big{ first }; big <= last; ++big) {
+        const int shift{ big - TerrainGeometry::wrap(big, n) };
+        if (shift != -n && shift != 0 && shift != n) {
+            return false;
+        }
+    }
+    return true;
 }
 
 Vec3 SamplerSearch::area_centroid(const Facet& f)
@@ -200,7 +219,7 @@ Vec3 SamplerSearch::area_centroid(const Facet& f)
 
 SamplerCandidate SamplerSearch::candidate(const Vec3& xs, const int index, const int sx, const int sy) const
 {
-    const Vec3& ce{ geometry_.cells()[static_cast<std::size_t>(index)].centroid };
+    const Vec3& ce{ geometry_.cell_centroid(static_cast<std::size_t>(index)) };
     const double dx{ ce.x + static_cast<double>(sx) - xs.x };
     const double dy{ ce.y + static_cast<double>(sy) - xs.y };
     const double dz{ ce.z - xs.z };
@@ -214,17 +233,10 @@ bool SamplerSearch::window(const Vec3& xs, const int m, std::vector<SamplerCandi
     const auto fx{ static_cast<int>(std::floor(xs.x)) };
     const auto fy{ static_cast<int>(std::floor(xs.y)) };
     const auto fz{ static_cast<int>(std::floor(xs.z)) };
-    for (int big_i{ fx - m }; big_i <= fx + m; ++big_i) {
-        const int sx{ big_i - TerrainGeometry::wrap(big_i, record.lx) };
-        if (sx != -record.lx && sx != 0 && sx != record.lx) {
-            return false;
-        }
-    }
-    for (int big_j{ fy - m }; big_j <= fy + m; ++big_j) {
-        const int sy{ big_j - TerrainGeometry::wrap(big_j, record.ly) };
-        if (sy != -record.ly && sy != 0 && sy != record.ly) {
-            return false;
-        }
+    const bool x_images{ three_images(fx - m, fx + m, record.lx) };
+    const bool y_images{ three_images(fy - m, fy + m, record.ly) };
+    if (!x_images || !y_images) {
+        return false;
     }
     out.clear();
     for (int big_i{ fx - m }; big_i <= fx + m; ++big_i) {
@@ -234,11 +246,9 @@ bool SamplerSearch::window(const Vec3& xs, const int m, std::vector<SamplerCandi
             const int k_first{ std::max(fz - m, kmin_) };
             const int k_last{ std::min(fz + m, kmin_ + nk_ - 1) };
             for (int k{ k_first }; k <= k_last; ++k) {
-                const std::size_t slot{ (static_cast<std::size_t>(i) * static_cast<std::size_t>(record.ly) + static_cast<std::size_t>(j)) * static_cast<std::size_t>(nk_)
-                                        + static_cast<std::size_t>(k - kmin_) };
-                const int index{ cell_index_[slot] };
+                const std::int64_t index{ geometry_.cell_index(i, j, k) };
                 if (index >= 0) {
-                    out.push_back(candidate(xs, index, big_i - i, big_j - j));
+                    out.push_back(candidate(xs, static_cast<int>(index), big_i - i, big_j - j));
                 }
             }
         }
@@ -252,7 +262,7 @@ void SamplerSearch::full_list(const Vec3& xs, std::vector<SamplerCandidate>& out
     const TerrainRecord& record{ geometry_.record() };
     const std::array<int, 3> shifts_x{ -record.lx, 0, record.lx };
     const std::array<int, 3> shifts_y{ -record.ly, 0, record.ly };
-    const auto count{ static_cast<int>(geometry_.cells().size()) };
+    const auto count{ static_cast<int>(geometry_.cell_count()) };
     out.clear();
     for (const int sx : shifts_x) {
         for (const int sy : shifts_y) {
@@ -266,7 +276,7 @@ void SamplerSearch::full_list(const Vec3& xs, std::vector<SamplerCandidate>& out
 
 Vec3 SamplerSearch::shifted_centroid(const SamplerCandidate& c) const
 {
-    const Vec3& ce{ geometry_.cells()[static_cast<std::size_t>(c.index)].centroid };
+    const Vec3& ce{ geometry_.cell_centroid(static_cast<std::size_t>(c.index)) };
     return Vec3{ ce.x + static_cast<double>(c.sx), ce.y + static_cast<double>(c.sy), ce.z };
 }
 
@@ -338,7 +348,7 @@ void SamplerSearch::weights(const Facet& f, FacetSample& sample) const
     const Vec3& xs{ sample.point };
     std::vector<StencilCandidate> candidates{};
     for (const SamplerCandidate& z : sample.kept) {
-        const Vec3& ce{ geometry_.cells()[static_cast<std::size_t>(z.index)].centroid };
+        const Vec3& ce{ geometry_.cell_centroid(static_cast<std::size_t>(z.index)) };
         // delta = (ce[0] + sx - xs[0], ce[1] + sy - xs[1], ce[2] - xs[2]), the expression of build_sampler
         const std::array<double, 3> delta{ ce.x + static_cast<double>(z.sx) - xs.x, ce.y + static_cast<double>(z.sy) - xs.y, ce.z - xs.z };
         candidates.push_back(StencilCandidate{ z.d2, z.index, z.sx, z.sy, delta });
@@ -360,7 +370,7 @@ void SamplerSearch::weights(const Facet& f, FacetSample& sample) const
             }
         }
         if (kept == nullptr || !kept->visible) {
-            const std::array<int, 3>& cell{ geometry_.cells()[static_cast<std::size_t>(z.index)].ijk };
+            const std::array<int, 3> cell{ geometry_.cell_ijk(static_cast<std::size_t>(z.index)) };
             sample.error = "R3: stencil cell (" + std::to_string(cell[0]) + ", " + std::to_string(cell[1]) + ", " + std::to_string(cell[2])
                            + ") not visible from the sample of facet " + f.key.python_text();
             return;

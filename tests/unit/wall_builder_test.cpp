@@ -4,10 +4,13 @@
 
 #include "experimental/wall_builder/correct_rounding.hpp"
 #include "experimental/wall_builder/dyadic.hpp"
+#include "experimental/wall_builder/terrain.hpp"
 #include "experimental/wall_builder/wide_int.hpp"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -20,7 +23,10 @@
 namespace {
 
 using fluidx3d::experimental::wall_builder::CorrectRounding;
+using fluidx3d::experimental::wall_builder::Direction;
 using fluidx3d::experimental::wall_builder::Dyadic;
+using fluidx3d::experimental::wall_builder::TerrainGeometry;
+using fluidx3d::experimental::wall_builder::TerrainRecord;
 using fluidx3d::experimental::wall_builder::WideInt;
 
 /// @brief One line of the reference file.
@@ -192,6 +198,46 @@ TEST(WallBuilderLibm, HypotMatchesPythonOnCellEdges)
         ++checked;
     }
     EXPECT_EQ(checked, 9);
+}
+
+// The column index of TerrainGeometry replaces the stored cell list: cell n is the n-th (i, j, k) in sorted order, the
+// first fluid layer of a column is the lowest k with k + 1 > its lowest node height, and the index wraps i and j.
+TEST(WallBuilderTerrain, ColumnIndexMatchesTheSortedCellList)
+{
+    TerrainRecord record{};
+    record.lx = 3;
+    record.ly = 2;
+    record.z_top = 5;
+    record.heights = { 0.5, 1.25, 2.0, 0.0, 3.5, 1.0 };
+    record.main_diagonal = { true, false, true, false, true, false };
+    record.directions = { Direction{ 0, 0, 0 } };
+    const TerrainGeometry geometry{ record, 2 };
+    std::size_t expected{ 0 };
+    for (int i{ 0 }; i < record.lx; ++i) {
+        for (int j{ 0 }; j < record.ly; ++j) {
+            const double h00{ record.heights[static_cast<std::size_t>(i * record.ly + j)] };
+            const double h01{ record.heights[static_cast<std::size_t>(i * record.ly + (j + 1) % record.ly)] };
+            const double h10{ record.heights[static_cast<std::size_t>(((i + 1) % record.lx) * record.ly + j)] };
+            const double h11{ record.heights[static_cast<std::size_t>(((i + 1) % record.lx) * record.ly + (j + 1) % record.ly)] };
+            const double lowest{ std::min({ h00, h01, h10, h11 }) };
+            int k_first{ 0 };
+            while (static_cast<double>(k_first + 1) <= lowest) {
+                ++k_first;
+            }
+            EXPECT_EQ(geometry.first_layer(i, j), k_first) << i << " " << j;
+            EXPECT_EQ(geometry.cell_index(i, j, k_first - 1), -1);
+            EXPECT_EQ(geometry.cell_index(i, j, record.z_top), -1);
+            for (int k{ k_first }; k < record.z_top; ++k) {
+                const std::array<int, 3> ijk{ geometry.cell_ijk(expected) };
+                EXPECT_EQ(ijk, (std::array<int, 3>{ i, j, k }));
+                EXPECT_EQ(geometry.cell_index(i, j, k), static_cast<std::int64_t>(expected));
+                EXPECT_EQ(geometry.cell_index(i + record.lx, j - record.ly, k), static_cast<std::int64_t>(expected));
+                ++expected;
+            }
+        }
+    }
+    EXPECT_EQ(geometry.cell_count(), expected);
+    EXPECT_EQ(geometry.column_first(record.lx), expected);
 }
 
 TEST(WallBuilderCorrectRounding, SubnormalThrows)

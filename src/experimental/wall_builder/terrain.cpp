@@ -4,11 +4,10 @@
 
 #include "terrain.hpp"
 
+#include "parallel_for.hpp"
+
 #include <algorithm>
-#include <atomic>
-#include <functional>
 #include <numeric>
-#include <thread>
 #include <cmath>
 #include <optional>
 #include <stdexcept>
@@ -186,44 +185,6 @@ public:
     }
 };
 
-/// @brief Runs work(index) for every index on all hardware threads; the first error in index order is rethrown.
-class ParallelFor {
-public:
-    static void run(const std::size_t count, const std::function<void(std::size_t)>& work)
-    {
-        const auto threads{ static_cast<int>(std::max(1u, std::thread::hardware_concurrency())) };
-        std::vector<std::string> errors(count);
-        std::atomic<std::size_t> next{ 0 };
-        const auto worker{ [&]() {
-            for (std::size_t n{ next.fetch_add(1) }; n < count; n = next.fetch_add(1)) {
-                try {
-                    work(n);
-                } catch (const std::exception& error) { // kept per index; the first is rethrown after the join
-                    errors[n] = error.what();
-                }
-            }
-        } };
-        std::vector<std::thread> pool{};
-        for (int k{ 0 }; k < threads; ++k) {
-            pool.emplace_back(worker);
-        }
-        for (std::thread& thread : pool) {
-            thread.join();
-        }
-        for (const std::string& error : errors) {
-            if (!error.empty()) {
-                throw std::runtime_error(error);
-            }
-        }
-    }
-};
-
-/// @brief The cells and facets of one column, in the serial order of Builder.__init__.
-struct ColumnResult {
-    std::vector<TerrainCell> cells{};
-    std::vector<Facet> facets{};
-};
-
 } // namespace
 
 // ------------------------------------------------------------------------------------------------ FacetKey
@@ -252,9 +213,13 @@ int TerrainGeometry::wrap(const int i, const int n)
     return r < 0 ? r + n : r;
 }
 
-TerrainGeometry::TerrainGeometry(TerrainRecord record)
+TerrainGeometry::TerrainGeometry(TerrainRecord record, const int threads)
     : record_{ std::move(record) }
+    , threads_{ threads }
 {
+    if (threads < 1) {
+        throw std::invalid_argument("TerrainGeometry: threads " + std::to_string(threads) + " (need 1 or more)");
+    }
     if (record_.lx < 1 || record_.ly < 1 || record_.heights.size() != static_cast<std::size_t>(record_.lx * record_.ly)) {
         throw std::domain_error("TerrainGeometry: " + std::to_string(record_.heights.size()) + " heights for a " + std::to_string(record_.lx) + " x "
                                 + std::to_string(record_.ly) + " box");
@@ -265,7 +230,9 @@ TerrainGeometry::TerrainGeometry(TerrainRecord record)
     const double lowest{ *std::min_element(record_.heights.begin(), record_.heights.end()) };
     zmin_ = static_cast<int>(std::floor(lowest));
     build_base_table();
-    build_cells_and_facets();
+    build_column_index();
+    build_cells();
+    build_facets();
 }
 
 double TerrainGeometry::height_value(const int i, const int j) const
@@ -286,7 +253,7 @@ void TerrainGeometry::build_base_table()
     bases_.resize(static_cast<std::size_t>(base_ni_) * static_cast<std::size_t>(base_nj_) * static_cast<std::size_t>(base_nk_));
     const auto layers{ static_cast<std::size_t>(base_nk_) };
     const auto columns_y{ static_cast<std::size_t>(base_nj_) };
-    ParallelFor::run(bases_.size(), [&](const std::size_t slot) {
+    ParallelFor::run(bases_.size(), threads_, [&](const std::size_t slot) {
         const auto a{ static_cast<int>(slot / (columns_y * layers)) };
         const auto b{ static_cast<int>((slot / layers) % columns_y) };
         const auto c{ static_cast<int>(slot % layers) };
@@ -527,45 +494,106 @@ void TerrainGeometry::cell_moments(TerrainCell& cell, const bool full)
     cell.centroid = Vec3{ local.x + i, local.y + j, local.z + k };
 }
 
-void TerrainGeometry::build_column(const int i, const int j, std::vector<TerrainCell>& cells, std::vector<Facet>& facets) const
-{
-    const double lowest{ std::min({ height_value(i, j), height_value(i, j + 1), height_value(i + 1, j), height_value(i + 1, j + 1) }) };
-    const double highest{ std::max({ height_value(i, j), height_value(i, j + 1), height_value(i + 1, j), height_value(i + 1, j + 1) }) };
-    for (int k{ zmin_ }; k < record_.z_top; ++k) {
-        if (static_cast<double>(k + 1) <= lowest) {
-            continue; // empty (exact classification)
-        }
-        std::vector<Poly> pieces{ cell_pieces(i, j, k) };
-        if (pieces.empty()) {
-            throw std::runtime_error("cell (" + std::to_string(i) + ", " + std::to_string(j) + ", " + std::to_string(k)
-                                     + ") classified fluid but has no piece");
-        }
-        const bool full{ static_cast<double>(k) >= highest };
-        TerrainCell cell{};
-        cell.ijk = { i, j, k };
-        cell.pieces = std::move(pieces);
-        cell_moments(cell, full);
-        cells.push_back(std::move(cell));
-        terrain_facets(i, j, k, { 0, 0, 0 }, facets);
-    }
-    facets.push_back(lid_facet(i, j, { 0, 0, 0 }));
-}
-
-void TerrainGeometry::build_cells_and_facets()
+void TerrainGeometry::build_column_index()
 {
     const auto columns{ static_cast<std::size_t>(record_.lx) * static_cast<std::size_t>(record_.ly) };
-    std::vector<ColumnResult> results(columns);
-    ParallelFor::run(columns, [&](const std::size_t n) {
-        const auto i{ static_cast<int>(n / static_cast<std::size_t>(record_.ly)) };
-        const auto j{ static_cast<int>(n % static_cast<std::size_t>(record_.ly)) };
-        build_column(i, j, results[n].cells, results[n].facets);
+    kfirst_.assign(columns, 0);
+    first_.assign(columns + 1, 0);
+    for (std::size_t c{ 0 }; c < columns; ++c) {
+        const auto i{ static_cast<int>(c / static_cast<std::size_t>(record_.ly)) };
+        const auto j{ static_cast<int>(c % static_cast<std::size_t>(record_.ly)) };
+        const double lowest{ std::min({ height_value(i, j), height_value(i, j + 1), height_value(i + 1, j), height_value(i + 1, j + 1) }) };
+        int k{ zmin_ };
+        while (k < record_.z_top && static_cast<double>(k + 1) <= lowest) { // bounded by z_top; the empty layers of Builder.__init__
+            ++k;
+        }
+        kfirst_[c] = k;
+        first_[c + 1] = first_[c] + (record_.z_top - k);
+        if (k < record_.z_top) {
+            lowest_layer_ = std::min(lowest_layer_, k);
+        }
+    }
+    if (first_.back() == 0) {
+        throw std::domain_error("TerrainGeometry: no fluid cell below z_top " + std::to_string(record_.z_top));
+    }
+}
+
+std::array<int, 3> TerrainGeometry::cell_ijk(const std::size_t n) const
+{
+    const auto cell{ static_cast<std::int64_t>(n) };
+    const auto above{ std::upper_bound(first_.begin(), first_.end(), cell) };
+    const auto column{ static_cast<std::size_t>(above - first_.begin()) - 1u };
+    const auto i{ static_cast<int>(column / static_cast<std::size_t>(record_.ly)) };
+    const auto j{ static_cast<int>(column % static_cast<std::size_t>(record_.ly)) };
+    const auto k{ kfirst_[column] + static_cast<int>(cell - first_[column]) };
+    return { i, j, k };
+}
+
+std::int64_t TerrainGeometry::cell_index(const int i, const int j, const int k) const
+{
+    const int wi{ wrap(i, record_.lx) };
+    const int wj{ wrap(j, record_.ly) };
+    const auto column{ static_cast<std::size_t>(wi) * static_cast<std::size_t>(record_.ly) + static_cast<std::size_t>(wj) };
+    if (k < kfirst_[column] || k >= record_.z_top) {
+        return -1;
+    }
+    return first_[column] + (k - kfirst_[column]);
+}
+
+TerrainCell TerrainGeometry::donor_cell(const std::size_t n) const
+{
+    TerrainCell cell{};
+    cell.ijk = cell_ijk(n);
+    cell.pieces = cell_pieces(cell.ijk[0], cell.ijk[1], cell.ijk[2]);
+    if (cell.pieces.empty()) {
+        throw std::runtime_error("cell (" + std::to_string(cell.ijk[0]) + ", " + std::to_string(cell.ijk[1]) + ", " + std::to_string(cell.ijk[2])
+                                 + ") classified fluid but has no piece");
+    }
+    // the donor pass copies the pieces for each direction; the copies share these cached volumes and moments
+    for (const Poly& piece : cell.pieces) {
+        static_cast<void>(piece.moment());
+    }
+    return cell;
+}
+
+void TerrainGeometry::build_cells()
+{
+    const std::size_t count{ static_cast<std::size_t>(first_.back()) };
+    volume_.assign(count, 0.0);
+    centroid_.assign(count, Vec3{});
+    local_.assign(count, Vec3{});
+    const auto columns{ static_cast<std::size_t>(record_.lx) * static_cast<std::size_t>(record_.ly) };
+    ParallelFor::run(columns, threads_, [&](const std::size_t c) {
+        const auto i{ static_cast<int>(c / static_cast<std::size_t>(record_.ly)) };
+        const auto j{ static_cast<int>(c % static_cast<std::size_t>(record_.ly)) };
+        const double highest{ std::max({ height_value(i, j), height_value(i, j + 1), height_value(i + 1, j), height_value(i + 1, j + 1) }) };
+        for (int k{ kfirst_[c] }; k < record_.z_top; ++k) {
+            const auto n{ static_cast<std::size_t>(first_[c] + (k - kfirst_[c])) };
+            TerrainCell cell{ donor_cell(n) };
+            const bool full{ static_cast<double>(k) >= highest };
+            cell_moments(cell, full);
+            volume_[n] = cell.volume;
+            centroid_[n] = cell.centroid;
+            local_[n] = cell.centroid_local;
+        }
+    });
+}
+
+void TerrainGeometry::build_facets()
+{
+    const auto columns{ static_cast<std::size_t>(record_.lx) * static_cast<std::size_t>(record_.ly) };
+    std::vector<std::vector<Facet>> per_column(columns);
+    ParallelFor::run(columns, threads_, [&](const std::size_t c) {
+        const auto i{ static_cast<int>(c / static_cast<std::size_t>(record_.ly)) };
+        const auto j{ static_cast<int>(c % static_cast<std::size_t>(record_.ly)) };
+        for (int k{ kfirst_[c] }; k < record_.z_top; ++k) {
+            terrain_facets(i, j, k, { 0, 0, 0 }, per_column[c]);
+        }
+        per_column[c].push_back(lid_facet(i, j, { 0, 0, 0 }));
     });
     std::vector<Facet> facet_list{};
-    for (ColumnResult& column : results) {
-        for (TerrainCell& cell : column.cells) {
-            cells_.push_back(std::move(cell));
-        }
-        for (Facet& facet : column.facets) {
+    for (std::vector<Facet>& column : per_column) {
+        for (Facet& facet : column) {
             facet_list.push_back(std::move(facet));
         }
     }

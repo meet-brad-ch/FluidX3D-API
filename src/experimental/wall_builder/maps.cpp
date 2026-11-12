@@ -83,6 +83,135 @@ SparseMatrix SparseOps::from_triplets(const std::int64_t rows, const std::int64_
     return m;
 }
 
+StateRows SparseOps::state_rows(const std::int64_t states, const std::int64_t columns, const std::vector<Triplet>& entries)
+{
+    // coo_tocsr keeps the entries of each row in input order: a stable sort by row does the same without offsets for
+    // every state
+    std::vector<Triplet> placed{ entries };
+    std::stable_sort(placed.begin(), placed.end(), [](const Triplet& a, const Triplet& b) { return a.row < b.row; });
+    StateRows m{ states, columns, {}, { 0 }, {}, {} };
+    auto first{ placed.begin() };
+    while (first != placed.end()) {
+        const std::int64_t row{ first->row };
+        if (row < 0 || row >= states) {
+            throw std::runtime_error("state_rows: row " + std::to_string(row) + " outside " + std::to_string(states) + " states");
+        }
+        const auto last{ std::find_if(first, placed.end(), [row](const Triplet& t) { return t.row != row; }) };
+        // sum_duplicates: sort the row by column, then add equal columns in that order
+        std::stable_sort(first, last, [](const Triplet& a, const Triplet& b) { return a.column < b.column; });
+        for (auto it{ first }; it != last;) {
+            double sum{ it->value };
+            const std::int64_t column{ it->column };
+            int count{ 1 };
+            for (++it; it != last && it->column == column; ++it) {
+                sum += it->value;
+                ++count;
+            }
+            if (count > 2) {
+                throw std::runtime_error("state_rows: " + std::to_string(count) + " entries at (" + std::to_string(row) + ", " + std::to_string(column)
+                                         + "): scipy's order of their sum is not reproducible");
+            }
+            m.indices.push_back(column);
+            m.values.push_back(sum);
+        }
+        m.state.push_back(row);
+        m.offsets.push_back(static_cast<std::int64_t>(m.indices.size()));
+        first = last;
+    }
+    return m;
+}
+
+StateValues SparseOps::times(const StateRows& m, const std::vector<double>& x)
+{
+    StateValues y{};
+    for (std::size_t r{ 0 }; r < m.state.size(); ++r) {
+        double sum{ 0.0 };
+        for (std::int64_t e{ m.offsets[r] }; e < m.offsets[r + 1u]; ++e) {
+            sum += m.values[static_cast<std::size_t>(e)] * x[static_cast<std::size_t>(m.indices[static_cast<std::size_t>(e)])];
+        }
+        y.state.push_back(m.state[r]);
+        y.value.push_back(sum);
+    }
+    return y;
+}
+
+StateValues SparseOps::column_sums(const SparseMatrix& m)
+{
+    // y[column] += value * 1.0 with the rows in order: per column, its entries in row order, from 0.0
+    std::vector<Triplet> entries{};
+    for (std::int64_t r{ 0 }; r < m.rows; ++r) {
+        for (std::int64_t e{ m.offsets[static_cast<std::size_t>(r)] }; e < m.offsets[static_cast<std::size_t>(r) + 1u]; ++e) {
+            entries.push_back(Triplet{ r, m.indices[static_cast<std::size_t>(e)], m.values[static_cast<std::size_t>(e)] });
+        }
+    }
+    std::stable_sort(entries.begin(), entries.end(), [](const Triplet& a, const Triplet& b) { return a.column < b.column; });
+    StateValues y{};
+    for (const Triplet& t : entries) {
+        const bool new_column{ y.state.empty() || y.state.back() != t.column };
+        if (new_column) {
+            y.state.push_back(t.column);
+            y.value.push_back(0.0);
+        }
+        y.value.back() += t.value * 1.0;
+    }
+    return y;
+}
+
+StateRows SparseOps::permuted_columns(const StateRows& m, const std::vector<std::int64_t>& column_order)
+{
+    std::vector<std::int64_t> new_column(static_cast<std::size_t>(m.columns), 0);
+    std::iota(new_column.begin(), new_column.end(), std::int64_t{ 0 });
+    for (std::size_t i{ 0 }; i < column_order.size(); ++i) {
+        new_column[static_cast<std::size_t>(column_order[i])] = static_cast<std::int64_t>(i);
+    }
+    StateRows out{ m.states, m.columns, {}, { 0 }, {}, {} };
+    std::vector<Triplet> row{};
+    for (std::size_t r{ 0 }; r < m.state.size(); ++r) {
+        row.clear();
+        for (std::int64_t e{ m.offsets[r] }; e < m.offsets[r + 1u]; ++e) {
+            const double value{ m.values[static_cast<std::size_t>(e)] };
+            if (value != 0.0) { // csr_matmat keeps only nonzero sums
+                row.push_back(Triplet{ m.state[r], new_column[static_cast<std::size_t>(m.indices[static_cast<std::size_t>(e)])], value });
+            }
+        }
+        if (row.empty()) {
+            continue;
+        }
+        std::sort(row.begin(), row.end(), [](const Triplet& a, const Triplet& b) { return a.column < b.column; });
+        for (const Triplet& t : row) {
+            out.indices.push_back(t.column);
+            out.values.push_back(t.value);
+        }
+        out.state.push_back(m.state[r]);
+        out.offsets.push_back(static_cast<std::int64_t>(out.indices.size()));
+    }
+    return out;
+}
+
+std::vector<double> SparseOps::row_sums(const SparseMatrix& m)
+{
+    std::vector<double> y(static_cast<std::size_t>(m.rows), 0.0);
+    for (std::int64_t r{ 0 }; r < m.rows; ++r) {
+        double sum{ 0.0 };
+        for (std::int64_t e{ m.offsets[static_cast<std::size_t>(r)] }; e < m.offsets[static_cast<std::size_t>(r) + 1u]; ++e) {
+            sum += m.values[static_cast<std::size_t>(e)] * 1.0;
+        }
+        y[static_cast<std::size_t>(r)] = sum;
+    }
+    return y;
+}
+
+// ------------------------------------------------------------------------------------------------ IdentityMax
+
+double IdentityMax::largest(const double current, const double value)
+{
+    const double magnitude{ std::fabs(value) };
+    if (std::isnan(current) || std::isnan(magnitude)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    return std::max(current, magnitude);
+}
+
 std::vector<double> SparseOps::times(const SparseMatrix& m, const std::vector<double>& x)
 {
     std::vector<double> y(static_cast<std::size_t>(m.rows), 0.0);
@@ -145,21 +274,6 @@ MapAssembly::MapAssembly(const TerrainGeometry& geometry, const VelocityTable& v
     , passes_{ passes }
     , sampler_{ sampler }
 {
-    const TerrainRecord& record{ geometry.record() };
-    int kmax{ std::numeric_limits<int>::min() };
-    kmin_ = std::numeric_limits<int>::max();
-    for (const TerrainCell& cell : geometry.cells()) {
-        kmin_ = std::min(kmin_, cell.ijk[2]);
-        kmax = std::max(kmax, cell.ijk[2]);
-    }
-    layers_ = kmax - kmin_ + 1;
-    cell_slots_.assign(static_cast<std::size_t>(record.lx) * static_cast<std::size_t>(record.ly) * static_cast<std::size_t>(layers_), -1);
-    for (std::size_t n{ 0 }; n < geometry.cells().size(); ++n) {
-        const std::array<int, 3>& c{ geometry.cells()[n].ijk };
-        cell_slots_[(static_cast<std::size_t>(c[0]) * static_cast<std::size_t>(record.ly) + static_cast<std::size_t>(c[1])) * static_cast<std::size_t>(layers_)
-                    + static_cast<std::size_t>(c[2] - kmin_)]
-            = static_cast<std::int64_t>(n);
-    }
     int moving{ 0 };
     for (const Direction& c : velocities.directions) {
         const bool rest{ c.x == 0 && c.y == 0 && c.z == 0 };
@@ -190,11 +304,10 @@ std::uint64_t MapAssembly::pack(const FacetKey& key)
 std::int64_t MapAssembly::cell_index(const int i, const int j, const int k) const
 {
     const TerrainRecord& record{ geometry_.record() };
-    if (i < 0 || i >= record.lx || j < 0 || j >= record.ly || k < kmin_ || k >= kmin_ + layers_) {
+    if (i < 0 || i >= record.lx || j < 0 || j >= record.ly) {
         return -1;
     }
-    return cell_slots_[(static_cast<std::size_t>(i) * static_cast<std::size_t>(record.ly) + static_cast<std::size_t>(j)) * static_cast<std::size_t>(layers_)
-                       + static_cast<std::size_t>(k - kmin_)];
+    return geometry_.cell_index(i, j, k);
 }
 
 int MapAssembly::facet_index(const FacetKey& key) const
@@ -207,52 +320,30 @@ int MapAssembly::facet_index(const FacetKey& key) const
     return facet_by_code_[static_cast<std::size_t>(found - facet_codes_.begin())];
 }
 
-const UnitResult* MapAssembly::producer_unit(const int facet, const int direction) const
+ProducerRowView MapAssembly::producer_unit(const int facet, const int direction) const
 {
     const int slot{ moving_slot_[static_cast<std::size_t>(direction)] };
     if (slot < 0) {
-        return nullptr;
+        return ProducerRowView{};
     }
-    return &passes_.facet_results()[static_cast<std::size_t>(facet)][static_cast<std::size_t>(slot)];
+    return passes_.row(static_cast<std::size_t>(facet), slot);
 }
 
-void MapAssembly::direct_entries(const std::vector<double>& volume, std::vector<Triplet>& out) const
-{
-    const TerrainRecord& record{ geometry_.record() };
-    const auto q{ static_cast<std::int64_t>(velocities_.directions.size()) };
-    for (std::size_t n{ 0 }; n < geometry_.cells().size(); ++n) {
-        const std::array<int, 3>& cell{ geometry_.cells()[n].ijk };
-        for (std::int64_t d{ 0 }; d < q; ++d) {
-            const double vol{ passes_.cell_results()[n][static_cast<std::size_t>(d)].direct[0].value };
-            if (vol == 0.0) {
-                continue;
-            }
-            const Direction& c{ velocities_.directions[static_cast<std::size_t>(d)] };
-            const std::array<int, 3> recv{ TerrainGeometry::wrap(cell[0] + c.x, record.lx), TerrainGeometry::wrap(cell[1] + c.y, record.ly), cell[2] + c.z };
-            const std::int64_t receiver{ cell_index(recv[0], recv[1], recv[2]) };
-            if (receiver < 0) {
-                throw std::runtime_error("direct " + PythonFloat::repr(vol) + " from " + cell_text(cell) + " along direction " + std::to_string(d)
-                                         + " into a non-fluid cell " + cell_text(recv));
-            }
-            const double ratio{ vol / volume[static_cast<std::size_t>(receiver)] };
-            out.push_back(Triplet{ receiver * q + d, static_cast<std::int64_t>(n) * q + d, ratio });
-        }
-    }
-}
-
-void MapAssembly::gather_entries(const std::vector<double>& volume, const std::vector<std::int64_t>& row_of, std::vector<Triplet>& g,
-                                 std::vector<Triplet>& r) const
+void MapAssembly::gather_entries(const std::vector<std::int64_t>& row_of, std::vector<Triplet>& g, std::vector<Triplet>& r) const
 {
     const auto q{ static_cast<std::int64_t>(velocities_.directions.size()) };
     std::vector<Accumulated> sums{};
     for (std::size_t f{ 0 }; f < geometry_.facets().size(); ++f) {
         for (std::int64_t d{ 0 }; d < q; ++d) {
-            const UnitResult* unit{ producer_unit(static_cast<int>(f), static_cast<int>(d)) };
-            if (unit == nullptr || unit->h.empty()) {
+            const ProducerRowView unit{ producer_unit(static_cast<int>(f), static_cast<int>(d)) };
+            if (unit.h.empty()) {
                 continue;
             }
+            if (!unit.has_vi) {
+                throw std::logic_error("a producer row with h but without vi");
+            }
             sums.clear();
-            for (const HEntry& e : unit->h) {
+            for (const HCell& e : unit.h) {
                 const std::int64_t cell{ cell_index(e.cell[0], e.cell[1], e.cell[2]) };
                 if (cell < 0) {
                     throw std::runtime_error("h of a non-fluid cell " + cell_text(e.cell));
@@ -260,11 +351,11 @@ void MapAssembly::gather_entries(const std::vector<double>& volume, const std::v
                 accumulate(sums, cell, e.value);
             }
             const std::int64_t row{ row_of[f * static_cast<std::size_t>(q) + static_cast<std::size_t>(d)] };
-            const double qv{ unit->vi[0].value };
+            const double qv{ unit.vi };
             const auto opposite{ static_cast<std::int64_t>(velocities_.opposites[static_cast<std::size_t>(d)]) };
             for (const Accumulated& s : sums) {
                 g.push_back(Triplet{ row, s.key * q + opposite, s.value });
-                const double scaled{ qv * volume[static_cast<std::size_t>(s.key)] };
+                const double scaled{ qv * geometry_.cell_volume(static_cast<std::size_t>(s.key)) };
                 r.push_back(Triplet{ s.key * q + d, row, s.value / scaled });
             }
         }
@@ -277,12 +368,12 @@ void MapAssembly::pending_entries(const std::vector<std::int64_t>& row_of, std::
     std::vector<Accumulated> sums{};
     for (std::size_t f{ 0 }; f < geometry_.facets().size(); ++f) {
         for (std::int64_t d{ 0 }; d < q; ++d) {
-            const UnitResult* unit{ producer_unit(static_cast<int>(f), static_cast<int>(d)) };
-            if (unit == nullptr || unit->w.empty()) {
+            const ProducerRowView unit{ producer_unit(static_cast<int>(f), static_cast<int>(d)) };
+            if (unit.w.empty()) {
                 continue;
             }
             sums.clear();
-            for (const WEntry& e : unit->w) {
+            for (const WFacet& e : unit.w) {
                 accumulate(sums, facet_index(e.gkey), e.value);
             }
             const auto opposite{ static_cast<std::size_t>(velocities_.opposites[static_cast<std::size_t>(d)]) };
@@ -302,32 +393,27 @@ void MapAssembly::pending_entries(const std::vector<std::int64_t>& row_of, std::
 AssembledMaps MapAssembly::assemble() const
 {
     const auto q{ static_cast<std::int64_t>(velocities_.directions.size()) };
-    const auto cells{ static_cast<std::int64_t>(geometry_.cells().size()) };
+    const auto cells{ static_cast<std::int64_t>(geometry_.cell_count()) };
     const auto facets{ static_cast<std::int64_t>(geometry_.facets().size()) };
     AssembledMaps m{};
-    for (const TerrainCell& cell : geometry_.cells()) {
-        m.volume.push_back(cell.volume);
-    }
     std::vector<std::int64_t> row_of(static_cast<std::size_t>(facets * q), -1);
     for (std::int64_t f{ 0 }; f < facets; ++f) {
         for (std::int64_t d{ 0 }; d < q; ++d) {
-            const UnitResult* unit{ producer_unit(static_cast<int>(f), static_cast<int>(d)) };
-            if (unit != nullptr && !unit->vi.empty()) {
+            const ProducerRowView unit{ producer_unit(static_cast<int>(f), static_cast<int>(d)) };
+            if (unit.has_vi) {
                 row_of[static_cast<std::size_t>(f * q + d)] = static_cast<std::int64_t>(m.rows.size());
                 m.rows.push_back(WallRow{ static_cast<int>(f), static_cast<int>(d) });
-                m.vi.push_back(unit->vi[0].value);
+                m.vi.push_back(unit.vi);
             }
         }
     }
     const auto rows{ static_cast<std::int64_t>(m.rows.size()) };
     const std::int64_t states{ cells * q };
-    std::vector<Triplet> d_entries{};
     std::vector<Triplet> g_entries{};
     std::vector<Triplet> r_entries{};
     std::vector<Triplet> w_entries{};
     std::vector<Triplet> s_entries{};
-    direct_entries(m.volume, d_entries);
-    gather_entries(m.volume, row_of, g_entries, r_entries);
+    gather_entries(row_of, g_entries, r_entries);
     pending_entries(row_of, w_entries);
     for (std::int64_t f{ 0 }; f < facets; ++f) {
         const FacetSample& sample{ sampler_.samples()[static_cast<std::size_t>(f)] };
@@ -335,35 +421,46 @@ AssembledMaps MapAssembly::assemble() const
             s_entries.push_back(Triplet{ f, sample.cells[n], sample.weights[n] });
         }
     }
-    m.d = SparseOps::from_triplets(states, states, d_entries);
     m.g = SparseOps::from_triplets(rows, states, g_entries);
-    m.r = SparseOps::from_triplets(states, rows, r_entries);
+    m.r = SparseOps::state_rows(states, rows, r_entries);
     m.w = SparseOps::from_triplets(rows, rows, w_entries);
     m.s = SparseOps::from_triplets(facets, cells, s_entries);
     return m;
 }
 
-MapProducts MapAssembly::products(const AssembledMaps& m) const
+StateProducts MapAssembly::state_products(const AssembledMaps& m)
 {
+    StateProducts p{};
+    p.one_g = SparseOps::column_sums(m.g);
+    p.r_vi = SparseOps::times(m.r, m.vi);
+    return p;
+}
+
+std::vector<double> MapAssembly::volume_times_r(const StateRows& r) const
+{
+    // Vs @ R: y[row] += value * Vs[state], the states in order; Vs[state] = V[state // q]
     const std::size_t q{ velocities_.directions.size() };
-    const std::size_t states{ m.volume.size() * q };
-    const std::size_t rows{ m.vi.size() };
-    MapProducts p{};
-    p.vs.assign(states, 0.0);
-    for (std::size_t s{ 0 }; s < states; ++s) {
-        p.vs[s] = m.volume[s / q];
+    std::vector<double> y(static_cast<std::size_t>(r.columns), 0.0);
+    for (std::size_t n{ 0 }; n < r.state.size(); ++n) {
+        const double vs{ geometry_.cell_volume(static_cast<std::size_t>(r.state[n]) / q) };
+        for (std::int64_t e{ r.offsets[n] }; e < r.offsets[n + 1u]; ++e) {
+            const auto column{ static_cast<std::size_t>(r.indices[static_cast<std::size_t>(e)]) };
+            y[column] += r.values[static_cast<std::size_t>(e)] * vs;
+        }
     }
+    return y;
+}
+
+RowProducts MapAssembly::row_products(const AssembledMaps& m) const
+{
+    const std::size_t rows{ m.vi.size() };
+    RowProducts p{};
     const std::vector<double> ones_rows(rows, 1.0);
-    const std::vector<double> ones_states(states, 1.0);
-    // eight independent products; each keeps scipy's summation order
+    // four independent products; each keeps scipy's summation order
     std::vector<std::thread> jobs{};
-    jobs.emplace_back([&]() { p.vs_d = SparseOps::left_times(p.vs, m.d); });
-    jobs.emplace_back([&]() { p.one_g = SparseOps::left_times(ones_rows, m.g); });
-    jobs.emplace_back([&]() { p.d_one = SparseOps::times(m.d, ones_states); });
-    jobs.emplace_back([&]() { p.r_vi = SparseOps::times(m.r, m.vi); });
-    jobs.emplace_back([&]() { p.g_one = SparseOps::times(m.g, ones_states); });
+    jobs.emplace_back([&]() { p.g_one = SparseOps::row_sums(m.g); });
     jobs.emplace_back([&]() { p.w_one = SparseOps::times(m.w, ones_rows); });
-    jobs.emplace_back([&]() { p.vs_r = SparseOps::left_times(p.vs, m.r); });
+    jobs.emplace_back([&]() { p.vs_r = volume_times_r(m.r); });
     jobs.emplace_back([&]() { p.one_w = SparseOps::left_times(ones_rows, m.w); });
     for (std::thread& job : jobs) {
         job.join();
@@ -371,27 +468,15 @@ MapProducts MapAssembly::products(const AssembledMaps& m) const
     return p;
 }
 
-IdentityValues MapAssembly::identities(const AssembledMaps& m, const MapProducts& p) const
+IdentityValues MapAssembly::row_identities(const AssembledMaps& m, const RowProducts& p)
 {
-    const std::size_t states{ p.vs.size() };
     const std::size_t rows{ m.vi.size() };
     IdentityValues out{};
-    // float(np.max(np.abs(x))): NaN propagates
-    const auto largest{ [](double current, const double value) {
-        const double magnitude{ std::fabs(value) };
-        return (std::isnan(current) || std::isnan(magnitude)) ? std::numeric_limits<double>::quiet_NaN() : std::max(current, magnitude);
-    } };
-    out.donor_partition = -1.0;
-    out.receiver_coverage = -1.0;
-    for (std::size_t s{ 0 }; s < states; ++s) {
-        out.donor_partition = largest(out.donor_partition, p.vs_d[s] + p.one_g[s] - p.vs[s]);
-        out.receiver_coverage = largest(out.receiver_coverage, p.d_one[s] + p.r_vi[s] - 1.0);
-    }
     out.prism_coverage = -1.0;
     out.return_delivery = -1.0;
     for (std::size_t r{ 0 }; r < rows; ++r) {
-        out.prism_coverage = largest(out.prism_coverage, p.g_one[r] + p.w_one[r] - m.vi[r]);
-        out.return_delivery = largest(out.return_delivery, p.vs_r[r] + p.one_w[r] / m.vi[r] - 1.0);
+        out.prism_coverage = IdentityMax::largest(out.prism_coverage, p.g_one[r] + p.w_one[r] - m.vi[r]);
+        out.return_delivery = IdentityMax::largest(out.return_delivery, p.vs_r[r] + p.one_w[r] / m.vi[r] - 1.0);
     }
     return out;
 }
@@ -414,48 +499,26 @@ GateFailure MapAssembly::failure(const std::string& name, const bool per_state, 
     return out;
 }
 
-GateReport MapAssembly::gate(const AssembledMaps& m, const MapProducts& p) const
+RowGate MapAssembly::row_gate(const AssembledMaps& m, const RowProducts& p)
 {
-    const std::size_t states{ p.vs.size() };
     const std::size_t rows{ m.vi.size() };
-    const std::vector<double>& vs{ p.vs };
-    const std::vector<double>& vs_d{ p.vs_d };
-    const std::vector<double>& one_g{ p.one_g };
-    const std::vector<double>& d_one{ p.d_one };
-    const std::vector<double>& r_vi{ p.r_vi };
-    const std::vector<double>& g_one{ p.g_one };
-    const std::vector<double>& w_one{ p.w_one };
-    const std::vector<double>& vs_r{ p.vs_r };
-    const std::vector<double>& one_w{ p.one_w };
-    std::vector<double> donor(states, 0.0);
-    std::vector<double> recv(states, 0.0);
-    for (std::size_t s{ 0 }; s < states; ++s) {
-        donor[s] = std::fabs(vs_d[s] + one_g[s] - vs[s]) / vs[s];
-        recv[s] = std::fabs(d_one[s] + r_vi[s] - 1.0);
-    }
     std::vector<double> prism(rows, 0.0);
     std::vector<double> ret(rows, 0.0);
     for (std::size_t r{ 0 }; r < rows; ++r) {
-        prism[r] = std::fabs(g_one[r] + w_one[r] - m.vi[r]) / m.vi[r];
-        ret[r] = std::fabs(vs_r[r] + one_w[r] / m.vi[r] - 1.0);
+        prism[r] = std::fabs(p.g_one[r] + p.w_one[r] - m.vi[r]) / m.vi[r];
+        ret[r] = std::fabs(p.vs_r[r] + p.one_w[r] / m.vi[r] - 1.0);
     }
-    GateReport report{};
     const auto all_finite{ [](const std::vector<double>& v) { return std::all_of(v.begin(), v.end(), [](const double x) { return std::isfinite(x); }); } };
-    report.finite = all_finite(m.volume) && all_finite(m.vi) && all_finite(m.d.values) && all_finite(m.g.values) && all_finite(m.r.values)
-                    && all_finite(m.w.values);
     const auto worst{ [&all_finite](const std::vector<double>& v) {
         return (!v.empty() && all_finite(v)) ? *std::max_element(v.begin(), v.end()) : std::numeric_limits<double>::quiet_NaN();
     } };
-    report.worst = IdentityValues{ worst(donor), worst(recv), worst(prism), worst(ret) };
-    const std::vector<GateFailure> candidates{ failure("donor_partition", true, donor), failure("receiver_coverage", true, recv),
-                                               failure("prism_coverage", false, prism), failure("return_delivery", false, ret) };
-    for (const GateFailure& f : candidates) {
-        if (!f.items.empty()) {
-            report.failing.push_back(f);
-        }
-    }
-    report.passed = report.finite && report.failing.empty();
-    return report;
+    RowGate gate{};
+    gate.finite = all_finite(m.vi) && all_finite(m.g.values) && all_finite(m.r.values) && all_finite(m.w.values);
+    gate.prism_worst = worst(prism);
+    gate.return_worst = worst(ret);
+    gate.prism = failure("prism_coverage", false, prism);
+    gate.ret = failure("return_delivery", false, ret);
+    return gate;
 }
 
 PermutedMaps MapAssembly::permute(const AssembledMaps& m) const
@@ -476,10 +539,9 @@ PermutedMaps MapAssembly::permute(const AssembledMaps& m) const
         weight_of_row[r] = velocities_.weights[static_cast<std::size_t>(rd[r])];
     }
     const std::vector<double> s0{ SparseOps::times(m.w, weight_of_row) };
-    p.d = m.d;
     p.s = m.s;
     p.g = SparseOps::permuted(m.g, p.order, {});
-    p.r = SparseOps::permuted(m.r, {}, p.order);
+    p.r = SparseOps::permuted_columns(m.r, p.order);
     p.w = SparseOps::permuted(m.w, p.order, p.order);
     for (const std::int64_t o : p.order) {
         p.row_facet.push_back(rf[static_cast<std::size_t>(o)]);
