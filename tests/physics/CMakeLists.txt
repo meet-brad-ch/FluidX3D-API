@@ -104,6 +104,70 @@ if(FLUIDX3D_BUILD_VOLUMETRIC_WALL_NATIVE)
     _fluidx3d_add_executable(physics_volumetric_wall_native_rr27 ${defines_dir_rr27} ${CMAKE_CURRENT_SOURCE_DIR}/volumetric_wall_native_fixture.cpp)
     target_include_directories(physics_volumetric_wall_native_rr27_setup PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     set_target_properties(physics_volumetric_wall_native_rr27 physics_volumetric_wall_native_rr27_setup PROPERTIES FLUIDX3D_PRECISE_FLOAT ON)
+    # V2: the same fixture with the static Smagorinsky rate (VOLUMETRIC_WALL_SGS): VW_SGS_K is required; VW_MODE=sgs_refusal
+    # tests the API refusals. The fixture contract is otherwise unchanged.
+    set(defines_dir_rr27_sgs ${CMAKE_CURRENT_BINARY_DIR}/volumetric_wall_native_rr27_sgs)
+    fluidx3d_configure_defines(${defines_dir_rr27_sgs} EXTENSIONS D3Q27 VOLUMETRIC_WALL VOLUMETRIC_WALL_FP64_COLLISION VOLUMETRIC_WALL_RR27 VOLUMETRIC_WALL_SGS VOLUME_FORCE UPDATE_FIELDS)
+    _fluidx3d_add_executable(physics_volumetric_wall_native_rr27_sgs ${defines_dir_rr27_sgs} ${CMAKE_CURRENT_SOURCE_DIR}/volumetric_wall_native_fixture.cpp)
+    target_include_directories(physics_volumetric_wall_native_rr27_sgs_setup PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(physics_volumetric_wall_native_rr27_sgs physics_volumetric_wall_native_rr27_sgs_setup PROPERTIES FLUIDX3D_PRECISE_FLOAT ON)
+    # V2: the same fixture with the facetwise rough friction as well (VOLUMETRIC_WALL_ROUGH, with SGS: the qualified reference is
+    # the rough law on the SGS candidate). The law comes from the container section facet_friction; VW_SGS_K is required as above.
+    set(defines_dir_rr27_sgs_rough ${CMAKE_CURRENT_BINARY_DIR}/volumetric_wall_native_rr27_sgs_rough)
+    fluidx3d_configure_defines(${defines_dir_rr27_sgs_rough} EXTENSIONS D3Q27 VOLUMETRIC_WALL VOLUMETRIC_WALL_FP64_COLLISION VOLUMETRIC_WALL_RR27 VOLUMETRIC_WALL_SGS VOLUMETRIC_WALL_ROUGH VOLUME_FORCE UPDATE_FIELDS)
+    _fluidx3d_add_executable(physics_volumetric_wall_native_rr27_sgs_rough ${defines_dir_rr27_sgs_rough} ${CMAKE_CURRENT_SOURCE_DIR}/volumetric_wall_native_fixture.cpp)
+    target_include_directories(physics_volumetric_wall_native_rr27_sgs_rough_setup PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(physics_volumetric_wall_native_rr27_sgs_rough physics_volumetric_wall_native_rr27_sgs_rough_setup PROPERTIES FLUIDX3D_PRECISE_FLOAT ON)
+    # Task 119: the rough SGS fixture with the whole-prism correction (VOLUMETRIC_WALL_T119), closed x. The container needs
+    # the sections t119_gdelta and t119_wmoment; the fixture contract is otherwise unchanged and adds t119_out and t119_negative_q to the capture.
+    set(defines_dir_rr27_sgs_rough_t119 ${CMAKE_CURRENT_BINARY_DIR}/volumetric_wall_native_rr27_sgs_rough_t119)
+    fluidx3d_configure_defines(${defines_dir_rr27_sgs_rough_t119} EXTENSIONS D3Q27 VOLUMETRIC_WALL VOLUMETRIC_WALL_FP64_COLLISION VOLUMETRIC_WALL_RR27 VOLUMETRIC_WALL_SGS VOLUMETRIC_WALL_ROUGH VOLUMETRIC_WALL_T119 VOLUME_FORCE UPDATE_FIELDS)
+    _fluidx3d_add_executable(physics_volumetric_wall_native_rr27_sgs_rough_t119 ${defines_dir_rr27_sgs_rough_t119} ${CMAKE_CURRENT_SOURCE_DIR}/volumetric_wall_native_fixture.cpp)
+    target_include_directories(physics_volumetric_wall_native_rr27_sgs_rough_t119_setup PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(physics_volumetric_wall_native_rr27_sgs_rough_t119 physics_volumetric_wall_native_rr27_sgs_rough_t119_setup PROPERTIES FLUIDX3D_PRECISE_FLOAT ON)
+    # Task 121: the T119 fixture with the task-120 state redistribution (VOLUMETRIC_WALL_SRD). The container needs the 18 sections t121_*.
+    set(defines_dir_rr27_sgs_rough_t119_srd ${CMAKE_CURRENT_BINARY_DIR}/volumetric_wall_native_rr27_sgs_rough_t119_srd)
+    fluidx3d_configure_defines(${defines_dir_rr27_sgs_rough_t119_srd} EXTENSIONS D3Q27 VOLUMETRIC_WALL VOLUMETRIC_WALL_FP64_COLLISION VOLUMETRIC_WALL_RR27 VOLUMETRIC_WALL_SGS VOLUMETRIC_WALL_ROUGH VOLUMETRIC_WALL_T119 VOLUMETRIC_WALL_SRD VOLUME_FORCE UPDATE_FIELDS)
+    _fluidx3d_add_executable(physics_volumetric_wall_native_rr27_sgs_rough_t119_srd ${defines_dir_rr27_sgs_rough_t119_srd} ${CMAKE_CURRENT_SOURCE_DIR}/volumetric_wall_native_fixture.cpp)
+    target_include_directories(physics_volumetric_wall_native_rr27_sgs_rough_t119_srd_setup PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(physics_volumetric_wall_native_rr27_sgs_rough_t119_srd physics_volumetric_wall_native_rr27_sgs_rough_t119_srd_setup PROPERTIES FLUIDX3D_PRECISE_FLOAT ON)
+    # V2 task 105: the rough SGS fixture with the open x axis (VOLUMETRIC_WALL_OPEN_X); the VW_OPEN_* declaration is required.
+    set(defines_dir_rr27_sgs_rough_open ${CMAKE_CURRENT_BINARY_DIR}/volumetric_wall_native_rr27_sgs_rough_open)
+    fluidx3d_configure_defines(${defines_dir_rr27_sgs_rough_open} EXTENSIONS D3Q27 VOLUMETRIC_WALL VOLUMETRIC_WALL_FP64_COLLISION VOLUMETRIC_WALL_RR27 VOLUMETRIC_WALL_SGS VOLUMETRIC_WALL_ROUGH VOLUMETRIC_WALL_OPEN_X VOLUME_FORCE UPDATE_FIELDS)
+    _fluidx3d_add_executable(physics_volumetric_wall_native_rr27_sgs_rough_open ${defines_dir_rr27_sgs_rough_open} ${CMAKE_CURRENT_SOURCE_DIR}/volumetric_wall_native_fixture.cpp)
+    target_include_directories(physics_volumetric_wall_native_rr27_sgs_rough_open_setup PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(physics_volumetric_wall_native_rr27_sgs_rough_open physics_volumetric_wall_native_rr27_sgs_rough_open_setup PROPERTIES FLUIDX3D_PRECISE_FLOAT ON)
+    # Task 123: the open-x rough SGS fixture with the state redistribution WITHOUT the task-119 correction (T119 is refused with OPEN_X by the task-119 port) (no registered flow qualification: a compile and load check only; the accepted hill run uses the T119 + SRD target below).
+    set(defines_dir_rr27_sgs_rough_open_srd ${CMAKE_CURRENT_BINARY_DIR}/volumetric_wall_native_rr27_sgs_rough_open_srd)
+    fluidx3d_configure_defines(${defines_dir_rr27_sgs_rough_open_srd} EXTENSIONS D3Q27 VOLUMETRIC_WALL VOLUMETRIC_WALL_FP64_COLLISION VOLUMETRIC_WALL_RR27 VOLUMETRIC_WALL_SGS VOLUMETRIC_WALL_ROUGH VOLUMETRIC_WALL_OPEN_X VOLUMETRIC_WALL_SRD VOLUME_FORCE UPDATE_FIELDS)
+    _fluidx3d_add_executable(physics_volumetric_wall_native_rr27_sgs_rough_open_srd ${defines_dir_rr27_sgs_rough_open_srd} ${CMAKE_CURRENT_SOURCE_DIR}/volumetric_wall_native_fixture.cpp)
+    target_include_directories(physics_volumetric_wall_native_rr27_sgs_rough_open_srd_setup PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(physics_volumetric_wall_native_rr27_sgs_rough_open_srd physics_volumetric_wall_native_rr27_sgs_rough_open_srd_setup PROPERTIES FLUIDX3D_PRECISE_FLOAT ON)
+    # Task 123: the open-x rough SGS fixture with the whole-prism correction AND the state redistribution (the combination of the accepted hill run); the T119 closed-only refusal is replaced by the runtime guard of set_volumetric_wall_affine.
+    set(defines_dir_rr27_sgs_rough_open_t119_srd ${CMAKE_CURRENT_BINARY_DIR}/volumetric_wall_native_rr27_sgs_rough_open_t119_srd)
+    fluidx3d_configure_defines(${defines_dir_rr27_sgs_rough_open_t119_srd} EXTENSIONS D3Q27 VOLUMETRIC_WALL VOLUMETRIC_WALL_FP64_COLLISION VOLUMETRIC_WALL_RR27 VOLUMETRIC_WALL_SGS VOLUMETRIC_WALL_ROUGH VOLUMETRIC_WALL_OPEN_X VOLUMETRIC_WALL_T119 VOLUMETRIC_WALL_SRD VOLUME_FORCE UPDATE_FIELDS)
+    _fluidx3d_add_executable(physics_volumetric_wall_native_rr27_sgs_rough_open_t119_srd ${defines_dir_rr27_sgs_rough_open_t119_srd} ${CMAKE_CURRENT_SOURCE_DIR}/volumetric_wall_native_fixture.cpp)
+    target_include_directories(physics_volumetric_wall_native_rr27_sgs_rough_open_t119_srd_setup PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(physics_volumetric_wall_native_rr27_sgs_rough_open_t119_srd physics_volumetric_wall_native_rr27_sgs_rough_open_t119_srd_setup PROPERTIES FLUIDX3D_PRECISE_FLOAT ON)
+    # V2 task 105 negative compile check (not in `all`): OPEN_X without RR27 must FAIL with "VOLUMETRIC_WALL_OPEN_X requires ...".
+    set(defines_dir_open_without_rr27 ${CMAKE_CURRENT_BINARY_DIR}/volumetric_wall_native_open_without_rr27_refusal)
+    fluidx3d_configure_defines(${defines_dir_open_without_rr27} EXTENSIONS VOLUMETRIC_WALL VOLUMETRIC_WALL_OPEN_X VOLUME_FORCE UPDATE_FIELDS)
+    _fluidx3d_add_executable(physics_volumetric_wall_native_open_without_rr27_refusal ${defines_dir_open_without_rr27} ${CMAKE_CURRENT_SOURCE_DIR}/volumetric_wall_native_fixture.cpp)
+    target_include_directories(physics_volumetric_wall_native_open_without_rr27_refusal_setup PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(physics_volumetric_wall_native_open_without_rr27_refusal physics_volumetric_wall_native_open_without_rr27_refusal_setup PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    # V2 negative compile check (not in `all`): ROUGH without RR27 must FAIL with "VOLUMETRIC_WALL_ROUGH requires VOLUMETRIC_WALL_RR27".
+    set(defines_dir_rough_without_rr27 ${CMAKE_CURRENT_BINARY_DIR}/volumetric_wall_native_rough_without_rr27_refusal)
+    fluidx3d_configure_defines(${defines_dir_rough_without_rr27} EXTENSIONS VOLUMETRIC_WALL VOLUMETRIC_WALL_ROUGH VOLUME_FORCE UPDATE_FIELDS)
+    _fluidx3d_add_executable(physics_volumetric_wall_native_rough_without_rr27_refusal ${defines_dir_rough_without_rr27} ${CMAKE_CURRENT_SOURCE_DIR}/volumetric_wall_native_fixture.cpp)
+    target_include_directories(physics_volumetric_wall_native_rough_without_rr27_refusal_setup PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(physics_volumetric_wall_native_rough_without_rr27_refusal physics_volumetric_wall_native_rough_without_rr27_refusal_setup PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    # V2 negative compile check (not in `all`; build it explicitly): RR27 + SGS + SUBGRID must FAIL to compile with the
+    # lbm.hpp #error "VOLUMETRIC_WALL_RR27 rejects SUBGRID ...". A successful build of this target is a FAILURE.
+    set(defines_dir_rr27_sgs_subgrid ${CMAKE_CURRENT_BINARY_DIR}/volumetric_wall_native_rr27_sgs_subgrid_refusal)
+    fluidx3d_configure_defines(${defines_dir_rr27_sgs_subgrid} EXTENSIONS D3Q27 VOLUMETRIC_WALL VOLUMETRIC_WALL_FP64_COLLISION VOLUMETRIC_WALL_RR27 VOLUMETRIC_WALL_SGS SUBGRID VOLUME_FORCE UPDATE_FIELDS)
+    _fluidx3d_add_executable(physics_volumetric_wall_native_rr27_sgs_subgrid_refusal ${defines_dir_rr27_sgs_subgrid} ${CMAKE_CURRENT_SOURCE_DIR}/volumetric_wall_native_fixture.cpp)
+    target_include_directories(physics_volumetric_wall_native_rr27_sgs_subgrid_refusal_setup PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(physics_volumetric_wall_native_rr27_sgs_subgrid_refusal physics_volumetric_wall_native_rr27_sgs_subgrid_refusal_setup PROPERTIES EXCLUDE_FROM_ALL TRUE)
     # Task 43: the off-path test with a uniform force, wall define off and on (no attachment)
     foreach(variant force_off force_on)
         set(defines_dir_${variant} ${CMAKE_CURRENT_BINARY_DIR}/volumetric_wall_native_${variant})

@@ -32,6 +32,18 @@
 //   VW_ROWS=container                 the supported path LBM::set_volumetric_wall: the container's friction_rows section, coefficient identities checked
 //   VW_ROWS=legacy [VW_PHI=FILE]      the research path LBM::set_volumetric_wall_research: the original kernel expression, or the rows
 //                                     file of the archived runs (tasks 39, 41, 42); reproduces every archived fixture
+// SGS closure (V2), builds with VOLUMETRIC_WALL_SGS only, where it is REQUIRED; refused in other builds:
+//   VW_SGS_K=k                        the constant k = 18 sqrt(2) (C Delta)^2 given to LBM::set_volumetric_wall_sgs before the
+//                                     attachment (hexadecimal text recommended; the qualified value is 0x1.8746d2p-1; 0 = the
+//                                     V1 rate). After the attachment the stored k (getter) is printed and written to VW_OUT/sgs_k.txt.
+//   VW_MODE=sgs_refusal VW_SGS_REFUSAL=value|after_attach|after_run   one isolated API refusal; the engine must stop (exit 1)
+// Open x (task 105), builds with VOLUMETRIC_WALL_OPEN_X only, where it is REQUIRED (no defaults); refused in other builds:
+//   VW_OPEN=x VW_OPEN_INLET_U=ux,uy,uz VW_OPEN_INLET_MODE=hard|relaxed,K_u VW_OPEN_SIGMA VW_OPEN_MACH VW_OPEN_LENGTH
+//   VW_OPEN_RHO_INF VW_OPEN_E_INITIAL=rho,ux,uy,uz   given to LBM::set_volumetric_wall_open_x before the attachment. Records:
+//   VW_OUT/open_declaration.txt (stored values and K_p, hex), VW_OUT/open_layout.txt (E cells, exterior facets and rows),
+//   and next to every step dump and checkpoint <prefix>_open_state.f64 (the E state of that level, 4 doubles per slot
+//   side*(Ny*Nz) + y + Ny*z) and <prefix>_open_meta.txt (t, open_failures). Modes: attach, step, protocol (the protocol
+//   series columns are the closed-box quantities; the open budgets are formed offline from the checkpoints).
 // Every output is raw (non-finite values kept); analysis is the research tree's job.
 #include "lbm.hpp"
 #include "physics_check.hpp"
@@ -107,6 +119,16 @@ public:
         if(!c.wall_state.empty()) { // task 98, RR27 only: rho_w, u_w (4 per facet), the one-per-facet delta, the rho_w failure count
             vector(prefix+"_wall_state.f64", c.wall_state); vector(prefix+"_delta.f64", c.delta);
             std::ofstream failures(prefix+"_wall_state_failures.txt"); failures << c.wall_state_failures << "\n";
+            if(!c.facet_law.empty()) vector(prefix+"_facet_law.f64", c.facet_law); // V2 ROUGH: (K0_a, C_a) per facet as uploaded
+        }
+        if(!c.t119_out.empty()) { // task 119, T119 builds only: B0, a (3), L/S per row, and the PR2-trigger count
+            vector(prefix+"_t119_out.f64", c.t119_out);
+            std::ofstream negative(prefix+"_t119_negative_q.txt"); negative << c.t119_negative_q << "\n";
+            std::ofstream p1(prefix+"_t119_p1.txt"); p1 << c.t119_p1 << "\n";
+        }
+        if(c.srd_stats.size()==6u) { // task 121, SRD builds only: the six cumulative counters of the redistribution
+            std::ofstream srd(prefix+"_srd_stats.txt");
+            srd << "cumulative_since_attachment 1\nnonpositive_mean " << c.srd_stats[0] << "\nsingular_B " << c.srd_stats[1] << "\nnonfinite_recon " << c.srd_stats[2] << "\nlimiter_entries " << c.srd_stats[3] << "\nnegative_fprime " << c.srd_stats[4] << "\nnonfinite_fprime " << c.srd_stats[5] << "\n";
         }
         std::ofstream meta(prefix+"_meta.txt");
         meta << "t " << c.t << "\nclamp_count " << c.clamp_count << "\n";
@@ -164,6 +186,131 @@ struct ForceInput {
     }
 };
 
+/// @brief V2: the SGS closure constant k of a run, from VW_SGS_K. A VOLUMETRIC_WALL_SGS build requires it; another build
+/// refuses it. The text is parsed as one number (hexadecimal floating-point text recommended, so the registered value is
+/// exact) and given to LBM::set_volumetric_wall_sgs unchanged: the engine, not the fixture, refuses a negative or
+/// non-finite k (the refusal tests of VW_MODE=sgs_refusal rely on this).
+struct SgsInput {
+    double value{ 0.0 };   ///< the parsed number (0 in a build without VOLUMETRIC_WALL_SGS)
+    std::string text{};    ///< the VW_SGS_K text
+    /// @brief Reads VW_SGS_K.
+    /// @throws std::invalid_argument when it is missing in an SGS build, set in another build, or not exactly one number
+    static SgsInput from_environment() {
+        SgsInput sgs{};
+        sgs.text = env("VW_SGS_K");
+#ifndef VOLUMETRIC_WALL_SGS
+        if(!sgs.text.empty()) {
+            throw std::invalid_argument("VW_SGS_K is set, but this executable is built without VOLUMETRIC_WALL_SGS");
+        }
+#else
+        if(sgs.text.empty()) {
+            throw std::invalid_argument("VW_SGS_K (one number, for example 0x1.8746d2p-1) is required in a VOLUMETRIC_WALL_SGS build");
+        }
+        char* end{ nullptr };
+        sgs.value = std::strtod(sgs.text.c_str(), &end);
+        if(end==sgs.text.c_str() || *end!='\0') {
+            throw std::invalid_argument("VW_SGS_K '"+sgs.text+"' is not exactly one number");
+        }
+#endif // VOLUMETRIC_WALL_SGS
+        return sgs;
+    }
+};
+
+/// @brief Task 105: the open-x declaration of a run (VOLUMETRIC_WALL_OPEN_X builds), from the environment. Every value is
+/// REQUIRED (no default: the registration declares each one; hexadecimal floating-point text recommended):
+///   VW_OPEN=x, VW_OPEN_INLET_U=ux,uy,uz, VW_OPEN_INLET_MODE=hard | relaxed,K_u, VW_OPEN_SIGMA, VW_OPEN_MACH, VW_OPEN_LENGTH (L_x),
+///   VW_OPEN_RHO_INF, VW_OPEN_E_INITIAL=rho,ux,uy,uz.
+/// A build without the macro refuses VW_OPEN. The engine (VolumetricWallOpenX::validate) refuses invalid values.
+struct OpenInput {
+    /// @brief One number of a list item.
+    /// @throws std::invalid_argument when the text is not exactly one number
+    static double number(const std::string& text, const std::string& name) {
+        char* end{ nullptr };
+        const double value{ std::strtod(text.c_str(), &end) };
+        if(text.empty() || end==text.c_str() || *end!='\0') throw std::invalid_argument(name+" '"+text+"' is not exactly one number");
+        return value;
+    }
+    /// @brief A comma list of exactly `count` numbers.
+    static std::vector<double> list(const std::string& text, const std::size_t count, const std::string& name) {
+        std::vector<double> values{};
+        std::stringstream ss(text);
+        std::string item{};
+        while(std::getline(ss, item, ',')) values.push_back(number(item, name));
+        if(values.size()!=count) throw std::invalid_argument(name+" needs exactly "+std::to_string(count)+" comma-separated numbers");
+        return values;
+    }
+    /// @brief Reads the declaration and gives it to the engine before the attachment (open builds), or refuses VW_OPEN.
+    /// @throws std::invalid_argument when a value is missing or malformed, or VW_OPEN is set in a closed build
+    static void apply(LBM& lbm) {
+        const std::string open{ env("VW_OPEN") };
+#ifndef VOLUMETRIC_WALL_OPEN_X
+        (void)lbm;
+        if(!open.empty()) throw std::invalid_argument("VW_OPEN is set, but this executable is built without VOLUMETRIC_WALL_OPEN_X (a closed build)");
+#else
+        if(open!="x") throw std::invalid_argument("VW_OPEN=x and the full open declaration are required in a VOLUMETRIC_WALL_OPEN_X build");
+        fluidx3d::experimental::VolumetricWallOpenX d{};
+        const std::vector<double> u{ list(env("VW_OPEN_INLET_U"), 3u, "VW_OPEN_INLET_U") };
+        d.inlet_velocity = { u[0], u[1], u[2] };
+        const std::string mode{ env("VW_OPEN_INLET_MODE") };
+        if(mode=="hard") {
+            d.hard_inlet = true;
+        } else if(mode.rfind("relaxed,", 0u)==0u) {
+            d.hard_inlet = false;
+            d.inlet_relaxation = number(mode.substr(8u), "VW_OPEN_INLET_MODE K_u");
+        } else {
+            throw std::invalid_argument("VW_OPEN_INLET_MODE must be hard or relaxed,K_u");
+        }
+        d.outlet_sigma = number(env("VW_OPEN_SIGMA"), "VW_OPEN_SIGMA");
+        d.outlet_mach = number(env("VW_OPEN_MACH"), "VW_OPEN_MACH");
+        d.outlet_length = number(env("VW_OPEN_LENGTH"), "VW_OPEN_LENGTH");
+        d.outlet_rho_inf = number(env("VW_OPEN_RHO_INF"), "VW_OPEN_RHO_INF");
+        const std::vector<double> e{ list(env("VW_OPEN_E_INITIAL"), 4u, "VW_OPEN_E_INITIAL") };
+        d.initial_rho = e[0];
+        d.initial_velocity = { e[1], e[2], e[3] };
+        lbm.set_volumetric_wall_open_x(d);
+#endif // VOLUMETRIC_WALL_OPEN_X
+    }
+    /// @brief After the attachment: VW_OUT/open_declaration.txt (the stored declaration and K_p as hexadecimal text) and
+    /// VW_OUT/open_layout.txt (E cells: mesh index, slot, outward sign, b-1, b-2; exterior facets with their E cell; exterior rows).
+    static void record(LBM& lbm, const std::string& out) {
+#ifdef VOLUMETRIC_WALL_OPEN_X
+        const fluidx3d::experimental::VolumetricWallOpenX d{ lbm.volumetric_wall_open_declaration() };
+        char text[768]{};
+        std::snprintf(text, sizeof(text), "inlet_velocity %a %a %a\nhard_inlet %d\ninlet_relaxation %a\nsigma %a\nmach %a\nlength %a\nrho_inf %a\ninitial %a %a %a %a\nK_p %a\n",
+            d.inlet_velocity[0], d.inlet_velocity[1], d.inlet_velocity[2], d.hard_inlet ? 1 : 0, d.inlet_relaxation, d.outlet_sigma, d.outlet_mach,
+            d.outlet_length, d.outlet_rho_inf, d.initial_rho, d.initial_velocity[0], d.initial_velocity[1], d.initial_velocity[2], d.outlet_relaxation());
+        std::ofstream declaration(out+"/open_declaration.txt");
+        declaration << text;
+        const std::array<uint, 3> paths{ lbm.volumetric_wall_open_e_paths() };
+        declaration << "e_cells_R " << paths[0] << "\ne_cells_support " << paths[1] << "\ne_cells_ordinary " << paths[2] << "\n";
+        const fluidx3d::experimental::VolumetricWallOpenLayout& layout{ lbm.volumetric_wall_open_layout() };
+        std::ofstream masks(out+"/open_layout.txt");
+        masks << "# " << layout.text() << "\n# e mesh slot sign b1 b2 | facet a e_cell | row r\n";
+        for(size_t k=0u; k<layout.e_cells().size(); k++) masks << "e " << layout.e_cells()[k] << ' ' << layout.e_slot()[k] << ' ' << layout.e_side()[k] << ' ' << layout.e_inward()[2u*k] << ' ' << layout.e_inward()[2u*k+1u] << '\n';
+        for(size_t a=0u; a<layout.exterior_facet().size(); a++) if(layout.exterior_facet()[a]!=0u) masks << "facet " << a << ' ' << layout.e_cell_of_facet()[a] << '\n';
+        for(size_t r=0u; r<layout.exterior_row().size(); r++) if(layout.exterior_row()[r]!=0u) masks << "row " << r << '\n';
+        if(!declaration || !masks) throw std::runtime_error("cannot write the open records in "+out);
+#else
+        (void)lbm; (void)out;
+#endif // VOLUMETRIC_WALL_OPEN_X
+    }
+    /// @brief The current E state and the refusal count next to a dump: <prefix>_open_state.f64 (4 doubles per slot
+    /// side*(Ny*Nz) + y + Ny*z) and <prefix>_open_meta.txt (t, open_failures). Nothing in a closed build.
+    static void dump(LBM& lbm, const std::string& prefix) {
+#ifdef VOLUMETRIC_WALL_OPEN_X
+        std::vector<double> state{};
+        lbm.volumetric_wall_read_open_state(state);
+        std::ofstream bin(prefix+"_open_state.f64", std::ios::binary);
+        bin.write(reinterpret_cast<const char*>(state.data()), static_cast<std::streamsize>(state.size()*sizeof(double)));
+        std::ofstream meta(prefix+"_open_meta.txt");
+        meta << "t " << lbm.get_t() << "\nopen_failures " << lbm.volumetric_wall_open_failures() << "\n";
+        if(!bin || !meta) throw std::runtime_error("cannot write "+prefix+"_open_state.f64");
+#else
+        (void)lbm; (void)prefix;
+#endif // VOLUMETRIC_WALL_OPEN_X
+    }
+};
+
 /// @brief The lattice of a container: the box, the solid flags (every non-mesh cell solid), the cell moments of f0.
 /// @brief Task 98: the direction tables of this build, made once.
 const fluidx3d::experimental::NativeDirections& directions_of_build() {
@@ -215,6 +362,19 @@ public:
     ForceInput force{ ForceInput::from_environment() };   ///< task 43: zero in a build without VOLUME_FORCE
 };
 
+/// @brief Task 105: the R cells by declaration of the attachment, so the fixture's embedding (the R order of every capture
+/// array, embedding_*.i64) equals the engine's: the E cells of the open-x layout in an open build, none otherwise.
+/// @param fx the fixture (its container)
+/// @return the mesh cells the engine forces into R
+std::vector<std::uint32_t> forced_r_cells(const Fixture& fx) {
+#ifdef VOLUMETRIC_WALL_OPEN_X
+    return fluidx3d::experimental::VolumetricWallOpenLayout(fx.input).e_cells();
+#else
+    (void)fx;
+    return {};
+#endif // VOLUMETRIC_WALL_OPEN_X
+}
+
 /// @brief Attach the wall as VW_ROWS says (task 43). The fixture reads the environment; the engine does not.
 /// @param lbm the lattice with its flags set
 /// @param path the container
@@ -222,18 +382,79 @@ public:
 void attach_wall(LBM& lbm, const std::string& path) {
     const std::string rows_mode{ env("VW_ROWS") };
     const std::string rows_file{ env("VW_PHI") };
+    const SgsInput sgs{ SgsInput::from_environment() };   // V2: checked in every build (refused where the macro is off)
+#ifdef VOLUMETRIC_WALL_SGS
+    lbm.set_volumetric_wall_sgs(sgs.value);                // before the attachment, which gives k to the kernels
+#else
+    (void)sgs;
+#endif // VOLUMETRIC_WALL_SGS
+#ifdef VOLUMETRIC_WALL_SRD
+    if(env("VW_SRD_CAPTURE")=="1") lbm.set_volumetric_wall_srd_capture(true);   // task 124: diagnostic capture of the pre-SRD stored state
+#endif // VOLUMETRIC_WALL_SRD
+    OpenInput::apply(lbm);                                 // task 105: the open declaration before the attachment (open builds), or the refusal of VW_OPEN
     if(rows_mode=="container") {
         if(!rows_file.empty()) {
             throw std::invalid_argument("VW_PHI is set together with VW_ROWS=container (the supported path takes its rows from the container only)");
         }
         lbm.set_volumetric_wall(path);
-        return;
-    }
-    if(rows_mode=="legacy") {
+    } else if(rows_mode=="legacy") {
         lbm.set_volumetric_wall_research(path, rows_file);
-        return;
+    } else {
+        throw std::invalid_argument("VW_ROWS must be container (supported path) or legacy (research path); it is '"+rows_mode+"'");
     }
-    throw std::invalid_argument("VW_ROWS must be container (supported path) or legacy (research path); it is '"+rows_mode+"'");
+    OpenInput::record(lbm, env("VW_OUT"));                 // task 105: the stored declaration and the classification (open builds)
+#ifdef VOLUMETRIC_WALL_SGS
+    { // V2: the record of the k the engine stored (read back with the getter, not the input text)
+        char line[160]{};
+        std::snprintf(line, sizeof(line), "%a", lbm.get_volumetric_wall_sgs());
+        std::printf("preflight: sgs_k %s stored (VW_SGS_K '%s')\n", line, sgs.text.c_str());
+        const std::string out{ env("VW_OUT") };
+        std::ofstream record(out+"/sgs_k.txt");
+        record << "sgs_k_input_text " << sgs.text << "\nsgs_k_stored_hex " << line << "\n";
+        if(!record) throw std::runtime_error("cannot write "+out+"/sgs_k.txt");
+    }
+#endif // VOLUMETRIC_WALL_SGS
+}
+
+/// @brief V2 (VOLUMETRIC_WALL_SGS builds): one isolated refusal of LBM::set_volumetric_wall_sgs, chosen by VW_SGS_REFUSAL.
+/// The engine must stop the program (print_error, exit 1); a return is a FAILURE.
+///   value         the call with the VW_SGS_K value before any attachment (for a negative or non-finite VW_SGS_K)
+///   after_attach  the attachment with VW_SGS_K, then a second call (refused: the kernels already have k)
+///   after_run     the attachment and run(0), then a second call (refused: the simulation is initialized)
+/// @param fx the fixture
+/// @param path the container
+/// @return 1 (reached only when the engine did not refuse)
+int run_sgs_refusal(const Fixture& fx, const std::string& path) {
+#ifndef VOLUMETRIC_WALL_SGS
+    (void)fx; (void)path;
+    throw std::invalid_argument("VW_MODE=sgs_refusal needs a VOLUMETRIC_WALL_SGS build");
+#else
+    const std::string which{ env("VW_SGS_REFUSAL") };
+    LBM* lbm = fx.make_lbm();
+    if(which=="value") {
+        const SgsInput sgs{ SgsInput::from_environment() };
+        std::printf("sgs_refusal value: set_volumetric_wall_sgs(%a) must stop\n", sgs.value);
+        std::fflush(stdout);
+        lbm->set_volumetric_wall_sgs(sgs.value);
+    } else if(which=="after_attach") {
+        attach_wall(*lbm, path);
+        std::printf("sgs_refusal after_attach: a second set_volumetric_wall_sgs must stop\n");
+        std::fflush(stdout);
+        lbm->set_volumetric_wall_sgs(lbm->get_volumetric_wall_sgs());
+    } else if(which=="after_run") {
+        attach_wall(*lbm, path);
+        lbm->run(0u);
+        std::printf("sgs_refusal after_run: set_volumetric_wall_sgs after run(0) must stop\n");
+        std::fflush(stdout);
+        lbm->set_volumetric_wall_sgs(lbm->get_volumetric_wall_sgs());
+    } else {
+        delete lbm;
+        throw std::invalid_argument("VW_SGS_REFUSAL must be value, after_attach or after_run; it is '"+which+"'");
+    }
+    std::printf("PHYSICS volumetric_wall_native: set_volumetric_wall_sgs (%s) was NOT refused FAILED\n", which.c_str());
+    delete lbm;
+    return 1;
+#endif // VOLUMETRIC_WALL_SGS
 }
 
 int run_attach(const Fixture& fx, const std::string& path, const std::string& out) {
@@ -245,7 +466,7 @@ int run_attach(const Fixture& fx, const std::string& path, const std::string& ou
     Dump::vector(out+"/attach_fi.f32", fi);
     // A1 (lossless part), whole domain (#273): every mesh cell's stored g equals fl32(f0 - w) exactly, read back through the
     // parity-0 load sets; the decoded level 0 fl64(w + g) differs from f0 by the rounding point R0 only (reported)
-    const VolumetricWallEmbedding embedding(fx.input, fx.solid);
+    const VolumetricWallEmbedding embedding(fx.input, fx.solid, forced_r_cells(fx));
     const NativeDirections dir(kQ);
     std::uint64_t mismatches{ 0u };
     double max_abs{ 0.0 }, max_r0{ 0.0 };
@@ -285,7 +506,7 @@ int run_attach_twice(const Fixture& fx, const std::string& path) {
 
 int run_sentinel(const Fixture& fx, const std::string& out) {
     // The R cells are flagged TYPE_V but no wall is attached: do_time_step runs ONLY the native stream_collide.
-    const VolumetricWallEmbedding embedding(fx.input, fx.solid);
+    const VolumetricWallEmbedding embedding(fx.input, fx.solid, forced_r_cells(fx));
     LBM* lbm = fx.make_lbm();
     for(const std::int64_t cell : embedding.r_cells()) lbm->flags[embedding.lattice_of_cell()[static_cast<size_t>(cell)]] |= TYPE_V;
     lbm->run(0u);
@@ -327,6 +548,7 @@ int run_steps(const Fixture& fx, const std::string& path, const std::string& out
     std::vector<fpxx> fi{};
     lbm->volumetric_wall_read_fi(fi);
     Dump::vector(out+"/step0000_fi.f32", fi);
+    OpenInput::dump(*lbm, out+"/step0000");                // task 105: E^0 (open builds)
     for(std::uint32_t s=1u; s<=steps; s++) {
         lbm->run(1u);
         char name[32]{};
@@ -334,6 +556,7 @@ int run_steps(const Fixture& fx, const std::string& path, const std::string& out
         lbm->volumetric_wall_read_fi(fi);
         Dump::vector(out+name+"_fi.f32", fi);
         Dump::capture(out+name, lbm->volumetric_wall_capture());
+        OpenInput::dump(*lbm, out+name);                   // task 105: E^s, the state of level s (open builds)
     }
     const VolumetricWallNativeCapture last{ lbm->volumetric_wall_capture() };
     std::printf("steps: %u done, t = %llu, native clamp activations %u, non-finite values in all dumps (host bit pattern) %llu\n", steps, static_cast<unsigned long long>(last.t), last.clamp_count, static_cast<unsigned long long>(Dump::non_finite_total));
@@ -464,7 +687,7 @@ struct PhaseTimers {
 /// impulse BEFORE the step. The replay mode feeds it from retained checkpoint files; the protocol mode from the device.
 class RowComputer {
 public:
-    RowComputer(const Fixture& fx, const double u0, const std::uint32_t axis) : fx_(fx), u0_(u0), axis_(axis), embedding_(fx.input, fx.solid), decoder_(fx), statics_(fx.input, decoder_.c_lex()) {
+    RowComputer(const Fixture& fx, const double u0, const std::uint32_t axis) : fx_(fx), u0_(u0), axis_(axis), embedding_(fx.input, fx.solid, forced_r_cells(fx)), decoder_(fx), statics_(fx.input, decoder_.c_lex()) {
         for(std::uint32_t cell=0u; cell<fx_.input.cells; cell++) mode_norm_ += fx_.input.volume[cell]*fx_.input.mode_phi[cell]*fx_.input.mode_phi[cell];
         capacity_.assign(fx_.input.rows, 0.0);   // W row sums (CF10 BoundedOperator.capacity)
         for(std::uint32_t row=0u; row<fx_.input.rows; row++) for(std::uint32_t z=fx_.input.W.offsets[row]; z<fx_.input.W.offsets[row+1u]; z++) capacity_[row] += fx_.input.W.weights[z];
@@ -653,10 +876,31 @@ public:
         row.at("delivered_tangential_impulse_x_cum") = delivered_cum[0]; row.at("delivered_tangential_impulse_y_cum") = delivered_cum[1]; row.at("delivered_tangential_impulse_z_cum") = delivered_cum[2];
         row.at("traction_identity_abs_sum") = traction_abs; row.at("traction_identity_ops") = static_cast<double>(traction_ops_); row.at("traction_identity_bound") = traction_bound;
         failure = nonfinite_fi>0u || nonfinite_cap>0u || L.min_f<-1e-12 || min_post_all<-1e-12 || min_q_over_vi<-1e-12 || pmin_next<-1e-12 || pratio_next<-1e-12 || zero_cap_new!=0.0 || cap.clamp_count>0u;
+#ifdef VOLUMETRIC_WALL_T119
+        // task 119 (restricted fail-fast test): the T115 screens (density departure 0.05, speed 0.3) and the explicit projection-required refusal (raw Q < 0, or the mass/tangential screen outside 1e-13): stop, keep the raw states
+        const bool t119_density{ L.max_dep>0.05 }, t119_speed{ L.max_speed>0.3 }, t119_projection{ cap.t119_negative_q>0u||cap.t119_p1>0u };
+        failure = failure || t119_density || t119_speed || t119_projection;
+        const std::string t119_reason{ std::string(t119_density ? " DENSITY_SCREEN" : "")+(t119_speed ? " SPEED_SCREEN" : "")+(t119_projection ? " PR2_PROJECTION_REQUIRED(raw Q<0 count "+std::to_string(cap.t119_negative_q)+", feasibility count "+std::to_string(cap.t119_p1)+")" : "") };
+#endif // VOLUMETRIC_WALL_T119
+#ifdef VOLUMETRIC_WALL_SRD
+        // task 121: the six device counters of the redistribution are CUMULATIVE since the attachment. A non-positive or non-finite neighbourhood mean (0), a singular B (1),
+        // a non-finite reconstruction (2) or a non-finite redistributed population (5) stop the run (the CPU raises); nothing is repaired. Counter 3 (limiter entries) is a report; counter 4 (a negative redistributed population) is covered by the min_f rule.
+        const bool srd_invalid{ cap.srd_stats.size()!=6u || cap.srd_stats[0]>0u || cap.srd_stats[1]>0u || cap.srd_stats[2]>0u || cap.srd_stats[5]>0u };
+        failure = failure || srd_invalid;
+        const std::string srd_reason{ srd_invalid ? " SRD_INVALID" : "" };
+#endif // VOLUMETRIC_WALL_SRD
         char buffer[512]{};
         std::snprintf(buffer, sizeof(buffer), "mass %.12f pending %.6e max|rho-1| %.3e min_f %.4f A %.6e clamp %u identity %.2e | nonfinite fi %llu cap %llu min_post_all %.3e min_Q/vi %.3e min_pending %.3e min_pending_ratio %.3e zero_capacity_pending %.3e",
                       L.mass, pend_next, L.max_dep, L.min_f, L.amplitude, cap.clamp_count, mass_identity_residual, static_cast<unsigned long long>(nonfinite_fi), static_cast<unsigned long long>(nonfinite_cap), min_post_all, min_q_over_vi, pmin_next, pratio_next, zero_cap_new);
         summary = buffer;
+#ifdef VOLUMETRIC_WALL_T119
+        summary += " | T119"+t119_reason;
+#endif // VOLUMETRIC_WALL_T119
+#ifdef VOLUMETRIC_WALL_SRD
+        if(cap.srd_stats.size()==6u) {
+            summary += " | SRD"+srd_reason+" counters(cumulative) mean<=0:"+std::to_string(cap.srd_stats[0])+" singularB:"+std::to_string(cap.srd_stats[1])+" nonfinite_recon:"+std::to_string(cap.srd_stats[2])+" limiter_entries:"+std::to_string(cap.srd_stats[3])+" negative_fprime:"+std::to_string(cap.srd_stats[4])+" nonfinite_fprime:"+std::to_string(cap.srd_stats[5]);
+        }
+#endif // VOLUMETRIC_WALL_SRD
         return row;
     }
 
@@ -673,7 +917,13 @@ private:
             mass_acc.add(V*rho); for(std::uint32_t a=0u; a<3u; a++) mom_acc[a].add(V*j[a]);
             L.max_dep = std::max(L.max_dep, std::fabs(rho-1.0));
             const double ux{ j[0]/rho }, uy{ j[1]/rho }, uz{ j[2]/rho };
+#ifdef VOLUMETRIC_WALL_SRD
+            // task 121: the speed screen uses the PHYSICAL velocity (sum c f + F/2)/rho of the half-force convention (the earlier fixtures omitted F/2); the other diagnostics keep ux, uy, uz
+            const double sx{ (j[0]+0.5*static_cast<double>(fx_.force.value[0]))/rho }, sy{ (j[1]+0.5*static_cast<double>(fx_.force.value[1]))/rho }, sz{ (j[2]+0.5*static_cast<double>(fx_.force.value[2]))/rho };
+            L.max_speed = std::max(L.max_speed, std::sqrt(sx*sx+sy*sy+sz*sz));
+#else
             L.max_speed = std::max(L.max_speed, std::sqrt(ux*ux+uy*uy+uz*uz));
+#endif // VOLUMETRIC_WALL_SRD
             // task 23: the reference axis a_ (z by default). For a_ = 2 these are the task-19 expressions term for term.
             const std::array<double, 3> u{ ux, uy, uz };
             const double t0{ axis_==0u ? (u[0]-u0_)*(u[0]-u0_) : u[0]*u[0] };
@@ -787,6 +1037,7 @@ int run_protocol(const Fixture& fx, const std::string& path, const std::string& 
     native_protocol::Sha256 rolling{};
     std::vector<fpxx> fi{}, fi_previous{};
     std::vector<double> pending{};
+    std::vector<double> open_before{};   // task 105 (#2421): the authoritative FP64 E state before the current update (open builds; empty otherwise)
     std::ofstream series_bin(out+"/series.f64", std::ios::binary);
     { std::ofstream header(out+"/series_header.txt"); header << SeriesRow::header() << "\n"; }
     std::ofstream hashes(out+"/rolling_sha256.txt");
@@ -799,7 +1050,17 @@ int run_protocol(const Fixture& fx, const std::string& path, const std::string& 
         lbm->volumetric_wall_read_pending(pending);
         Dump::vector(out+name+"_fi.f32", fi);
         Dump::vector(out+name+"_pending.f64", pending);
+#if defined(VOLUMETRIC_WALL_SRD) && defined(VOLUMETRIC_WALL_OPEN_X)
+        if(step>0u && env("VW_SRD_CAPTURE")=="1") { std::vector<fpxx> pe{}; lbm->volumetric_wall_pre_wall_fi(pe); Dump::vector(out+name+"_pre_wall_fi.f32", pe); }   // task 125: for the oracle budget decode
+#endif
+#ifdef VOLUMETRIC_WALL_SRD
+        if(step>0u && env("VW_SRD_CAPTURE")=="1") { std::vector<fpxx> pre{}; lbm->volumetric_wall_srd_pre_fi(pre); Dump::vector(out+name+"_pre_srd_fi.f32", pre); }   // task 124: the stored state the SRD stages of this update consumed (diagnostic copy)
+#endif // VOLUMETRIC_WALL_SRD
         if(step>0u) { Dump::vector(out+name+"_before_fi.f32", before); if(cap) Dump::capture(out+name+"_capture", *cap); }
+        OpenInput::dump(*lbm, out+name);                   // task 105: the E state of this checkpoint's level (open builds)
+#ifdef VOLUMETRIC_WALL_OPEN_X
+        if(step>0u) Dump::vector(out+name+"_before_open_state.f64", open_before); // #2421: E^(n-1), the state the captured update read
+#endif // VOLUMETRIC_WALL_OPEN_X
         std::ofstream meta(out+name+"_meta.txt");
         meta << "step " << step << "\nt " << lbm->get_t() << "\nreason " << why << "\nbefore_fi " << (step>0u ? "yes" : "no") << "\ncapture " << (step>0u && cap ? "yes" : "no") << "\n";
         timers.io += PhaseTimers::now()-t0;
@@ -838,6 +1099,104 @@ int run_protocol(const Fixture& fx, const std::string& path, const std::string& 
         std::printf("warm-up: %u steps without readback in %.3f s; the instrumented window starts at t = %llu\n", warmup, PhaseTimers::now()-w0, static_cast<unsigned long long>(lbm->get_t()));
     }
     if(std::find(checkpoints.begin(), checkpoints.end(), 0u)!=checkpoints.end()) checkpoint(0u, "registered", fi, nullptr);
+#ifdef VOLUMETRIC_WALL_OPEN_X
+    // task 105 (#2410): the OPEN inventory of every level, labelled and separate from the closed series (whose mass_fluid and
+    // momentum columns keep their closed meaning: every fluid cell and every pending row). Omega = the mesh cells that are not E
+    // cells; pending: the interior rows only (exterior rows hold no pending, O4). Columns: step, t, M_open = sum_Omega V sum f +
+    // sum_interior s, Px, Py, Pz = sum_Omega V sum c f - sum_interior c_r s_r, mass_pending_interior, open_failures (cumulative).
+    std::ofstream open_inventory_bin(out+"/open_inventory.f64", std::ios::binary);
+    { std::ofstream header(out+"/open_inventory_header.txt"); header << "step,t,M_open,Px_open,Py_open,Pz_open,mass_pending_interior,open_failures\n# Omega = mesh cells except E cells; pending = interior rows (contract Section 4); the closed series.f64 columns are all-cell quantities\n"; }
+    { std::ofstream note(out+"/series_header_note.txt"); note << "VOLUMETRIC_WALL_OPEN_X build: series.f64 mass/momentum columns include the E cells and every row (the closed-box quantities); the open inventory is open_inventory.f64\n"; }
+    const Decoder open_decoder(fx);
+    const fluidx3d::experimental::VolumetricWallOpenLayout& open_layout{ lbm->volumetric_wall_open_layout() };
+    const auto open_row = [&](const std::uint32_t step, const std::vector<fpxx>& state, const std::vector<double>& pend) {
+        const std::uint32_t parity{ static_cast<std::uint32_t>(lbm->get_t()%2ull) };
+        native_protocol::Neumaier mass{}, pend_mass{};
+        std::array<native_protocol::Neumaier, 3> mom{};
+        std::array<double, kQ> f{};
+        for(std::uint32_t cell=0u; cell<fx.input.cells; cell++) {
+            if(open_layout.slot_of_cell()[cell]>=0) continue;
+            open_decoder.load(state, cell, parity, f);
+            const double V{ fx.input.volume[cell] };
+            for(std::uint32_t d=0u; d<kQ; d++) { mass.add(V*f[d]); for(std::uint32_t a=0u; a<3u; a++) mom[a].add(V*f[d]*open_decoder.c_lex()[d][a]); }
+        }
+        for(std::uint32_t r=0u; r<fx.input.rows; r++) {
+            if(open_layout.exterior_row()[r]!=0u) continue;
+            pend_mass.add(pend[r]);
+            for(std::uint32_t a=0u; a<3u; a++) mom[a].add(-open_decoder.c_lex()[fx.input.row_direction[r]][a]*pend[r]);
+        }
+        const std::array<double, 8> v{ static_cast<double>(step), static_cast<double>(lbm->get_t()), mass.value()+pend_mass.value(), mom[0].value(), mom[1].value(), mom[2].value(),
+                                       pend_mass.value(), static_cast<double>(lbm->volumetric_wall_open_failures()) };
+        open_inventory_bin.write(reinterpret_cast<const char*>(v.data()), static_cast<std::streamsize>(v.size()*sizeof(double)));
+    };
+    // #2422: the four boundary transfers of every update (contract Section 4, the reference OpenPass), formed on the host from
+    // the per-step capture and the container tables, one row per step in open_flux.f64: step, t, then mass and momentum
+    // (x, y, z) of (1) E -> Omega, (2) exterior return, (3) Omega -> E, (4) exterior gather, then the interior impulse sum J
+    // (x, y, z): 2 + 16 + 3 = 21 doubles. Sources: post of R cells (cap.post; E cells are R cells and hold feq3 of E^n, no
+    // arm), the stored post of ordinary donors (decoded store set), cap.Q, cap.incoming, cap.returned and cap.direct_increment
+    // (owned states of R receivers), cap.impulse (exterior facets are 0). (3) = direct from Omega donors + their arm increment +
+    // the returns into E minus the exterior-row part; (4) = incoming of exterior rows minus their E-donor gathers (the Omega part
+    // with its arms); exterior rows hold no pending (O4).
+    std::ofstream open_flux_bin(out+"/open_flux.f64", std::ios::binary);
+    { std::ofstream header(out+"/open_flux_header.txt");
+      header << "step,t,m1,p1x,p1y,p1z,m2,p2x,p2y,p2z,m3,p3x,p3y,p3z,m4,p4x,p4y,p4z,Jx,Jy,Jz\n# (1) E->Omega (2) exterior return (3) Omega->E (4) exterior gather; Phi_in = m1+m2, Phi_out = m3+m4 (contract Section 4)\n"; }
+    const std::vector<std::int64_t>& open_rindex{ rows.embedding().r_index_of_cell() };
+    const auto is_e = [&](const std::uint32_t cell) { return open_layout.slot_of_cell()[cell]>=0; };
+    const auto open_flux = [&](const std::uint32_t step, const std::vector<fpxx>& state, const VolumetricWallNativeCapture& cap) {
+        const std::uint32_t q{ kQ };
+        const std::uint32_t parity_before{ static_cast<std::uint32_t>((cap.t-1u)%2u) };
+        std::array<double, kQ> stored{};
+        const auto post = [&](const std::uint32_t st) -> double {   // the post-collision value of a donor state as the transport used it
+            const std::uint32_t cell{ st/q }, d{ st%q };
+            const std::int64_t r{ open_rindex[cell] };
+            if(r>=0) return cap.post[static_cast<size_t>(r)*q+d];
+            open_decoder.post(state, cell, parity_before, stored);
+            return stored[d];
+        };
+        const auto& c{ open_decoder.c_lex() };
+        std::array<native_protocol::Neumaier, 4> m{};
+        std::array<std::array<native_protocol::Neumaier, 3>, 4> p{};
+        const auto add = [&](const std::uint32_t k, const double amount, const std::uint32_t dir) { m[k].add(amount); for(std::uint32_t a=0u; a<3u; a++) p[k][a].add(amount*c[dir][a]); };
+        const fluidx3d::experimental::NativeSparseMap& D{ fx.input.D };
+        for(std::uint32_t rs=0u; rs<D.rows; rs++) {   // (1) and (3) direct
+            const std::uint32_t rc{ rs/q }, rd{ rs%q };
+            const double V{ fx.input.volume[rc] };
+            for(std::uint32_t z=D.offsets[rs]; z<D.offsets[rs+1u]; z++) {
+                const std::uint32_t dc{ D.indices[z]/q };
+                if(is_e(dc) && !is_e(rc)) add(0u, V*D.weights[z]*post(D.indices[z]), rd);
+                if(!is_e(dc) && is_e(rc)) add(2u, V*D.weights[z]*post(D.indices[z]), rd);
+            }
+            if(is_e(rc)) {   // (3) the arm increment and the interior returns into E receivers (owned states of R cells)
+                const std::int64_t r{ open_rindex[rc] };
+                const double dinc{ cap.direct_increment[static_cast<size_t>(r)*q+rd] };
+                double back{ cap.returned[static_cast<size_t>(r)*q+rd] };
+                for(std::uint32_t z=fx.input.R.offsets[rs]; z<fx.input.R.offsets[rs+1u]; z++) if(open_layout.exterior_row()[fx.input.R.indices[z]]!=0u) back -= fx.input.R.weights[z]*cap.Q[fx.input.R.indices[z]];
+                add(2u, V*(dinc+back), rd);
+            } else {   // (2) the exterior returns into Omega receivers
+                for(std::uint32_t z=fx.input.R.offsets[rs]; z<fx.input.R.offsets[rs+1u]; z++) if(open_layout.exterior_row()[fx.input.R.indices[z]]!=0u) add(1u, V*fx.input.R.weights[z]*cap.Q[fx.input.R.indices[z]], rd);
+            }
+        }
+        for(std::uint32_t r=0u; r<fx.input.rows; r++) {   // (1) interior gathers from E donors, (4) exterior gathers from Omega donors
+            const bool exterior{ open_layout.exterior_row()[r]!=0u };
+            double e_part{ 0.0 };
+            std::uint32_t dir{ 0u };
+            for(std::uint32_t z=fx.input.G.offsets[r]; z<fx.input.G.offsets[r+1u]; z++) {
+                dir = fx.input.G.indices[z]%q;
+                if(!is_e(fx.input.G.indices[z]/q)) continue;
+                const double amount{ fx.input.G.weights[z]*post(fx.input.G.indices[z]) };
+                if(exterior) e_part += amount; else add(0u, amount, dir);
+            }
+            if(exterior && fx.input.G.offsets[r+1u]>fx.input.G.offsets[r]) add(3u, cap.incoming[r]-cap.pending_old[r]-e_part, dir);
+        }
+        std::array<native_protocol::Neumaier, 3> J{};
+        for(std::uint32_t a=0u; a<fx.input.facets; a++) for(std::uint32_t k=0u; k<3u; k++) J[k].add(cap.impulse[3u*a+k]);
+        std::array<double, 21> v{};
+        v[0] = static_cast<double>(step); v[1] = static_cast<double>(cap.t);
+        for(std::uint32_t k=0u; k<4u; k++) { v[2u+4u*k] = m[k].value(); for(std::uint32_t a=0u; a<3u; a++) v[3u+4u*k+a] = p[k][a].value(); }
+        for(std::uint32_t k=0u; k<3u; k++) v[18u+k] = J[k].value();
+        open_flux_bin.write(reinterpret_cast<const char*>(v.data()), static_cast<std::streamsize>(v.size()*sizeof(double)));
+    };
+#endif // VOLUMETRIC_WALL_OPEN_X
     lbm->volumetric_wall_read_fi(fi_previous);
     lbm->volumetric_wall_read_pending(pending);
     rolling.update(fi_previous.data(), fi_previous.size()*sizeof(fpxx));
@@ -847,7 +1206,13 @@ int run_protocol(const Fixture& fx, const std::string& path, const std::string& 
     pending_hashes << "0 " << last_pending_hex << "\n";
     std::vector<double> pending_previous{ pending };
     { SeriesRow row{ rows.row_zero(fi_previous, pending_previous, static_cast<std::uint64_t>(lbm->get_t())) }; write_row(row); }
+#ifdef VOLUMETRIC_WALL_OPEN_X
+    open_row(0u, fi_previous, pending_previous);
+#endif // VOLUMETRIC_WALL_OPEN_X
     for(std::uint32_t s=1u; s<=steps; s++) {
+#ifdef VOLUMETRIC_WALL_OPEN_X
+        lbm->volumetric_wall_read_open_state(open_before); // #2421: E^(s-1), read before the update s (saved at a checkpoint of step s)
+#endif // VOLUMETRIC_WALL_OPEN_X
         double t0{ PhaseTimers::now() };
         lbm->run(1u);
         double t1{ PhaseTimers::now() }; timers.gpu_step += t1-t0;
@@ -862,6 +1227,16 @@ int run_protocol(const Fixture& fx, const std::string& path, const std::string& 
         SeriesRow row{ rows.row_step(s, fi_previous, fi, cap, pending_previous, J_cum, requested_cum, delivered_cum, failure, summary) };
         double t5{ PhaseTimers::now() }; timers.rows += t5-t4;
         write_row(row);
+#ifdef VOLUMETRIC_WALL_OPEN_X
+        open_row(s, fi, cap.pending_new);
+        if(lbm->volumetric_wall_open_failures()!=0u) { failure = true; summary += " | OPEN_FAILURE(cumulative count "+std::to_string(lbm->volumetric_wall_open_failures())+")"; }   // task 125 (scientist #3110): a refused E state stops the run at the first failing update (test control only)
+#if defined(VOLUMETRIC_WALL_SRD) && defined(VOLUMETRIC_WALL_OPEN_X)
+        if(env("VW_SRD_CAPTURE")=="1") { std::vector<fpxx> pre_wall{}; lbm->volumetric_wall_pre_wall_fi(pre_wall); open_flux(s, pre_wall, cap); }   // task 125: the donors' stored post BEFORE the E store (the final state aliases the new E populations in the shared slots)
+        else open_flux(s, fi, cap);
+#else
+        open_flux(s, fi, cap);
+#endif
+#endif // VOLUMETRIC_WALL_OPEN_X
         hashes << s << " " << rolling.hex() << "\n";
         last_pending_hex = sha256_hex_of(cap.pending_new);
         pending_hashes << s << " " << last_pending_hex << "\n";
@@ -1038,6 +1413,136 @@ int run_poison(const Fixture& fx, const std::string& path) {
     return 1;
 }
 
+#ifdef VOLUMETRIC_WALL_OPEN_X
+/// @brief Task 125 control: the ACTUAL host admission predicate vw_open_refusal on the registered values (outlet s = +1, inlet s = -1; u_n = s ux): the closed endpoints +-eps, +-eps/2, 0, and wrong-sign 2 eps and 1e-6.
+/// Writes open_admission.json (text per case); returns 0 when every expectation holds, else 1.
+int run_open_admission(const std::string& out) {
+    const double eps{ 1e-13 };
+    struct Case { const char* name; int s; double un; bool admitted; };
+    const std::vector<Case> cases{ { "outlet un=0", 1, 0.0, true }, { "outlet un=+eps/2", 1, eps/2, true }, { "outlet un=-eps/2", 1, -eps/2, true }, { "outlet un=-eps (closed endpoint)", 1, -eps, true },
+        { "outlet un=-2 eps (wrong sign)", 1, -2.0*eps, false }, { "outlet un=-1e-6 (wrong sign)", 1, -1e-6, false }, { "outlet un=+1e-6", 1, 1e-6, true },
+        { "inlet un=0", -1, 0.0, true }, { "inlet un=+eps/2", -1, eps/2, true }, { "inlet un=-eps/2", -1, -eps/2, true }, { "inlet un=+eps (closed endpoint)", -1, eps, true },
+        { "inlet un=+2 eps (wrong sign)", -1, 2.0*eps, false }, { "inlet un=+1e-6 (wrong sign)", -1, 1e-6, false }, { "inlet un=-1e-6", -1, -1e-6, true } };
+    std::ofstream json(out+"/open_admission.json");
+    json << "{\n";
+    bool all_ok{ true };
+    for(std::size_t i=0u; i<cases.size(); i++) {
+        const Case& k{ cases[i] };
+        const std::string text{ vw_open_refusal(1.0, static_cast<double>(k.s)*k.un, 0.0, 0.0, k.s) };   // ux = s un, so that un = s ux
+        const bool admitted{ text.empty() };
+        const bool ok{ admitted==k.admitted };
+        all_ok = all_ok && ok;
+        json << " \"" << k.name << "\": {\"admitted\": " << (admitted ? "true" : "false") << ", \"expected\": " << (k.admitted ? "true" : "false") << ", \"text\": \"" << text << "\"}" << (i+1u<cases.size() ? "," : "") << "\n";
+        std::printf("open_admission: %-40s admitted %d expected %d %s\n", k.name, admitted ? 1 : 0, k.admitted ? 1 : 0, ok ? "ok" : "MISMATCH");
+    }
+    json << "}\n";
+    return PhysicsCheck::report("volumetric_wall_native_open_admission_controls", all_ok ? 0.0 : 100.0, 50.0) ? 0 : 1;
+}
+#endif // VOLUMETRIC_WALL_OPEN_X
+
+#ifdef VOLUMETRIC_WALL_SRD
+/// @brief Task 121 operator check: the state redistribution alone, on a given decoded level. VW_STATE is a raw float64 file of cells x 27 populations
+/// (lexicographic, the level to redistribute); VW_PARITY (0 or 1) is the parity of the level-t1 load sets it is encoded into. The fixture attaches the
+/// wall (which uploads the tables), encodes fl32_RTE(f - w) into the load sets of every mesh cell (all other words are zero), keeps the pending as the
+/// container's s0 or VW_PENDING (raw float64, rows), applies the three stages once, and writes the raw fi before and after, the pending before and after,
+/// the neighbourhood means, the reconstructed values and the six counters. Then it repeats the three stages VW_TIMING_REPEAT times (default 200) for the
+/// kernel time per application (the repeated applications change the state; the written outputs are those of the first application only).
+/// @param fx the fixture
+/// @param path the container (with the t121 sections)
+/// @param out the output folder
+/// @return 0 when every written value is finite, else 1
+int run_srd_operator(const Fixture& fx, const std::string& path, const std::string& out) {
+    const std::string state_path{ env("VW_STATE") }, parity_text{ env("VW_PARITY") }, pending_path{ env("VW_PENDING") }, repeat_text{ env("VW_TIMING_REPEAT") };
+    if(state_path.empty() || parity_text.empty()) {
+        throw std::invalid_argument("VW_MODE=srd_operator needs VW_STATE (float64 cells x 27) and VW_PARITY (0 or 1)");
+    }
+    const std::uint32_t parity{ static_cast<std::uint32_t>(std::stoul(parity_text)) };
+    if(parity>1u) {
+        throw std::invalid_argument("VW_PARITY must be 0 or 1");
+    }
+    const std::uint32_t repeat{ repeat_text.empty() ? 200u : static_cast<std::uint32_t>(std::stoul(repeat_text)) };
+    const std::vector<double> state{ read_raw<double>(state_path) };
+    if(state.size()!=static_cast<size_t>(fx.input.cells)*kQ) {
+        throw std::invalid_argument("VW_STATE has "+std::to_string(state.size())+" values, expected cells x 27 = "+std::to_string(static_cast<size_t>(fx.input.cells)*kQ));
+    }
+    preflight_k(fx);
+    LBM* lbm = fx.make_lbm();
+    attach_wall(*lbm, path);
+    lbm->run(0u);
+    const NativeDirections& dir{ directions_of_build() };
+    std::vector<fpxx> fi(static_cast<size_t>(lbm->get_N())*kQ, 0.0f);
+    for(std::uint32_t cell=0u; cell<fx.input.cells; cell++) {
+        const auto own{ fx.addresses.own_set(fx.lattice(cell), parity) };
+        for(std::uint32_t k=0u; k<kQ; k++) {
+            const std::uint32_t d{ dir.fx_to_lex(k) };
+            const double g{ state[static_cast<size_t>(cell)*kQ+d]-dir.weight_lex(d) };
+            fi[static_cast<size_t>(own[k])] = static_cast<float>(g);
+        }
+    }
+    lbm->volumetric_wall_write_fi(fi);
+    if(!pending_path.empty()) {
+        lbm->volumetric_wall_write_pending(read_raw<double>(pending_path));
+    }
+    std::vector<double> pending_before{};
+    lbm->volumetric_wall_read_pending(pending_before);
+    std::vector<fpxx> fi_before{};
+    lbm->volumetric_wall_read_fi(fi_before);
+    lbm->volumetric_wall_srd_apply(static_cast<ulong>(parity));
+    std::vector<fpxx> fi_after{};
+    std::vector<double> pending_after{}, qhat{}, recon{};
+    std::vector<uint> stats{};
+    lbm->volumetric_wall_read_fi(fi_after);
+    lbm->volumetric_wall_read_pending(pending_after);
+    lbm->volumetric_wall_srd_read(qhat, recon, stats);
+    // word accounting: every changed raw word must lie in the load set of an active cell (the stages write nothing else)
+    std::vector<std::uint8_t> active_word(fi_before.size(), 0u);
+    for(const std::uint32_t cell : fx.input.srd.active_cells) {
+        const auto own{ fx.addresses.own_set(fx.lattice(cell), parity) };
+        for(std::uint32_t k=0u; k<kQ; k++) {
+            active_word[static_cast<size_t>(own[k])] = 1u;
+        }
+    }
+    std::uint64_t changed_in_active{ 0u }, changed_outside{ 0u };
+    for(size_t a=0u; a<fi_before.size(); a++) {
+        if(std::memcmp(&fi_before[a], &fi_after[a], sizeof(fpxx))!=0) {
+            (active_word[a] ? changed_in_active : changed_outside)++;
+        }
+    }
+    std::vector<fpxx> g_before(static_cast<size_t>(fx.input.cells)*kQ), g_after(static_cast<size_t>(fx.input.cells)*kQ);   // stored g per cell, lexicographic
+    for(std::uint32_t cell=0u; cell<fx.input.cells; cell++) {
+        const auto own{ fx.addresses.own_set(fx.lattice(cell), parity) };
+        for(std::uint32_t k=0u; k<kQ; k++) {
+            const size_t slot{ static_cast<size_t>(cell)*kQ+dir.fx_to_lex(k) };
+            g_before[slot] = fi_before[static_cast<size_t>(own[k])];
+            g_after[slot] = fi_after[static_cast<size_t>(own[k])];
+        }
+    }
+    Dump::vector(out+"/operator_before_g.f32", g_before);
+    Dump::vector(out+"/operator_after_g.f32", g_after);
+    Dump::vector(out+"/operator_before_fi.f32", fi_before);
+    Dump::vector(out+"/operator_after_fi.f32", fi_after);
+    Dump::vector(out+"/operator_pending_before.f64", pending_before);
+    Dump::vector(out+"/operator_pending_after.f64", pending_after);
+    Dump::vector(out+"/operator_qhat.f64", qhat);
+    Dump::vector(out+"/operator_recon.f64", recon);
+    const auto first = std::chrono::steady_clock::now();
+    for(std::uint32_t i=0u; i<repeat; i++) {
+        lbm->volumetric_wall_srd_apply(static_cast<ulong>(parity));
+    }
+    const double seconds{ std::chrono::duration<double>(std::chrono::steady_clock::now()-first).count() };
+    {
+        std::ofstream summary(out+"/operator_summary.txt");
+        summary << "counters_cumulative_since_attachment 1\nchanged_words_in_active_load_sets " << changed_in_active << "\nchanged_words_outside_active_load_sets " << changed_outside << "\nparity " << parity << "\ncells " << fx.input.cells << "\nstats_nonpositive_mean " << stats[0] << "\nstats_singular_B " << stats[1]
+                << "\nstats_nonfinite_recon " << stats[2] << "\nstats_limiter_entries " << stats[3] << "\nstats_negative_after " << stats[4]
+                << "\nstats_nonfinite_after " << stats[5] << "\ntiming_repeat " << repeat << "\ntiming_seconds_per_application " << (repeat>0u ? seconds/repeat : 0.0) << "\n";
+    }
+    std::printf("srd_operator: parity %u, counters %u %u %u %u %u %u, %.6f ms per application (%u repeats)\n", parity, stats[0], stats[1], stats[2], stats[3], stats[4], stats[5],
+                repeat>0u ? 1000.0*seconds/repeat : 0.0, repeat);
+    delete lbm;
+    return PhysicsCheck::report("volumetric_wall_native_srd_operator_completed", static_cast<double>(Dump::non_finite_total), 0.5) ? 0 : 1;
+}
+#endif // VOLUMETRIC_WALL_SRD
+
 /// @brief Task 98 (#1973): resume in a FRESH process from saved raw state files. The container identity is pinned: the
 /// SHA-256 of the VW_INPUT bytes must equal VW_RESUME_CONTAINER_SHA256. The new LBM attaches the wall, runs run(0), writes the
 /// saved raw fi (FluidX3D esoteric layout, level t) and pending (FP64, level t), sets the time step t and runs VW_M steps.
@@ -1132,9 +1637,14 @@ void main_setup() { // VW_MODE attach|sentinel|step|restart, VW_INPUT container,
             }
             { // task 98 (#1983): the embedding lists of this container, in every mode: embedding_R_cells.i64 (the R-cell order of every
               // capture array), embedding_R_rows.i64 and embedding_native_rows.i64 (state = cell*q + d), little-endian int64
-                const VolumetricWallEmbedding lists(fx.input, fx.solid);
+                const VolumetricWallEmbedding lists(fx.input, fx.solid, forced_r_cells(fx));
                 lists.write_lists(out+"/embedding");
             }
+#ifdef VOLUMETRIC_WALL_OPEN_X
+            if(mode=="restart" || mode=="resume" || mode=="sentinel" || mode=="poison" || mode=="sgs_refusal") { // task 105: these modes do not save or restore the E state (or do not attach with the declaration); refused instead of inexact
+                throw std::invalid_argument("VW_MODE="+mode+" is not supported in a VOLUMETRIC_WALL_OPEN_X build (use attach, step or protocol)");
+            }
+#endif // VOLUMETRIC_WALL_OPEN_X
             if(mode=="attach") code = run_attach(fx, path, out);
             else if(mode=="attach_twice") code = run_attach_twice(fx, path);
             else if(mode=="sentinel") code = run_sentinel(fx, out);
@@ -1142,8 +1652,15 @@ void main_setup() { // VW_MODE attach|sentinel|step|restart, VW_INPUT container,
             else if(mode=="restart") code = run_restart(fx, path, out, n, m);
             else if(mode=="resume") code = run_resume(fx, path, out, m);   // task 98: fresh-process resume from saved raw files
             else if(mode=="poison") code = run_poison(fx, path);   // #2034: a synthetic invalid wall state must stop run() (RR27 builds)
+            else if(mode=="sgs_refusal") code = run_sgs_refusal(fx, path);   // V2: one isolated refusal of set_volumetric_wall_sgs (SGS builds)
             else if(mode=="protocol") code = run_protocol(fx, path, out, n, env("VW_CHECKPOINTS"));
             else if(mode=="replay") code = run_replay(fx, env("VW_RUN"), out);
+#ifdef VOLUMETRIC_WALL_OPEN_X
+            else if(mode=="open_admission") code = run_open_admission(out);   // task 125: the actual host admission predicate on the registered control values
+#endif // VOLUMETRIC_WALL_OPEN_X
+#ifdef VOLUMETRIC_WALL_SRD
+            else if(mode=="srd_operator") code = run_srd_operator(fx, path, out);   // task 121: the redistribution alone on a given decoded level
+#endif // VOLUMETRIC_WALL_SRD
             else std::printf("unknown VW_MODE %s\n", mode.c_str());
         }
     } catch(const std::exception& error) {

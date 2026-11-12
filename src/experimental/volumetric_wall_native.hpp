@@ -15,6 +15,7 @@
 #include <array>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
@@ -59,6 +60,39 @@ struct VolumetricWallNativeInput {
     std::vector<double> f0{};                   ///< Initial populations, states, densities, lexicographic order.
     std::vector<double> s0{};                   ///< Initial pending amounts per row.
     std::vector<double> friction_rows{};        ///< Optional section "friction_rows" (task 43): rows*3 friction vectors phi_r in the exported row order, lattice units of area; empty when the container has none. The supported packer writes the accepted P2 construction.
+    std::vector<double> facet_friction{};       ///< V2 optional section "facet_friction": facets*2 (K0_a, C_a) of the rough law K_a = K0_a + 3 C_a |u_s,a| (finite, >= 0); empty when the container has none (then every facet uses the scalar friction K). Needs VOLUMETRIC_WALL_ROUGH at the attachment.
+    std::vector<std::uint32_t> facet_kind{};    ///< V2 optional section "facet_kind": facets values, 0 = terrain, 1 = lid (geometry metadata from the builder keys; the friction does not read it); empty when absent.
+    std::vector<double> t119_gdelta{};          ///< Task 119 OPTIONAL section "t119_gdelta" (all of t119_* or none): 3 per G entry (stored CSR order), the offset of the prism part centroid from the prism centroid C_full, lattice units. Companion of the whole-prism correction (MATHEMATICAL_MODEL.md section 15.11); experimental, not part of the qualified V2 container.
+    std::vector<double> t119_wmoment{};         ///< Task 119 OPTIONAL section "t119_wmoment": 3 per W entry (stored CSR order), the first moment of the owned part about C_full (m_b = integral over the owned part of (x - C_full)), lattice units^4.
+    /// @brief Task 121 OPTIONAL sections of the task-120 state redistribution (18 sections t121_*, all or none; schema v2/hill_demo/e1/T121_SRD_SECTION_SCHEMA_E1.md).
+    /// Indices are container mesh cells; CSR offsets are exclusive prefix sums; every value is copied from the registered static tables (FP64, bitwise).
+    struct SrdTables {
+        std::vector<std::uint32_t> seeds{};          ///< Seed cells, ascending (S).
+        std::vector<std::uint32_t> entry_starts{};   ///< S+1 offsets of the averaging-group entries per seed.
+        std::vector<std::uint32_t> entry_cell{};     ///< Member cell i of every entry (E).
+        std::vector<double> entry_w{};               ///< w_ij per entry.
+        std::vector<double> entry_wv{};              ///< w_ij V_i per entry.
+        std::vector<double> entry_delta{};           ///< 3 per entry: C_i - xhat_j.
+        std::vector<double> vhat{};                  ///< Vhat_j per seed.
+        std::vector<std::uint32_t> st_starts{};      ///< S+1 offsets of the reconstruction-stencil entries per seed.
+        std::vector<std::uint32_t> st_cell{};        ///< Stencil cell k per entry (T).
+        std::vector<double> st_w{};                  ///< Vhat_k per stencil entry.
+        std::vector<double> st_d{};                  ///< 3 per stencil entry: xhat_k - xhat_j.
+        std::vector<std::int32_t> st_seed_index{};   ///< Index of k in seeds, or -1 (a singleton label: Q_k = f_k).
+        std::vector<double> B{};                     ///< 9 per seed, row-major B_j.
+        std::vector<double> st_wsum{};               ///< Sum of st_w per seed.
+        std::vector<std::uint32_t> active_cells{};   ///< Cells in some averaging group, ascending (A).
+        std::vector<double> active_coef{};           ///< Singleton coefficient c_i per active cell.
+        std::vector<std::uint32_t> active_starts{};  ///< A+1 offsets into active_entry.
+        std::vector<std::uint32_t> active_entry{};   ///< Entry index per (active cell, member) pair (E).
+        /// @brief True when the sections are present.
+        bool present() const { return !seeds.empty(); }
+        /// @brief Sizes, index ranges, CSR structure, positivity and the symmetric positive definite B of every seed.
+        /// @param cells number of mesh cells of the container
+        /// @throws std::invalid_argument naming the first failed check
+        void validate(std::uint32_t cells) const;
+    };
+    SrdTables srd{};                            ///< Task 121 sections; empty when the container has none.
     // Task 55 (2026-11-09): the six OPTIONAL sections of the affine transport candidate (research; all six or none).
     // Their presence selects the candidate path of LBM::set_volumetric_wall. A container without them is read, checked
     // and executed exactly as before.
@@ -105,6 +139,8 @@ struct VolumetricWallNativeInput {
     mutable FrictionRowResiduals friction_row_residuals{};
     /// @brief Task 55: true when the container holds the six sections of the affine transport candidate.
     bool affine() const { return !gradient_cells.empty(); }
+    bool t119() const { return !t119_gdelta.empty(); }   ///< true when the task-119 whole-prism companion sections are present
+    bool has_srd() const { return srd.present(); }   ///< true when the task-121 state-redistribution sections are present
     /// @brief Task 55: the fail-closed check of the candidate sections. Sizes against D and G, finite values, arms not
     /// longer than the cell diagonal, three rows of equal stencil per gradient cell with the own cell first, stencil
     /// cells inside the mesh, zero row sums (1e-10). The friction rows are checked for the tensor identity and the
@@ -233,6 +269,11 @@ struct VolumetricWallNativeCapture {
     std::vector<double> wall_state{};           ///< Task 98, RR27 path only: rho_w, u_w (x, y, z) per facet, the even reference of the return. Empty otherwise.
     std::vector<double> delta{};                ///< Task 98, RR27 path only: the one-per-facet mass correction delta per facet. Empty otherwise.
     std::uint32_t wall_state_failures{};        ///< Task 98, RR27 path only: facets with a non-finite or non-positive rho_w since attachment (no clamp; any count invalidates the run).
+    std::vector<double> t119_out{};             ///< Task 119 (VOLUMETRIC_WALL_T119 builds only): B0, a (3), L/S per row (5 per row) of the last update. Empty otherwise.
+    std::uint32_t t119_negative_q{};            ///< Task 119: row updates with raw outgoing Q < 0 since the attachment (the first PR2 projection trigger).
+    std::uint32_t t119_p1{};                    ///< Task 119: facet updates outside the mass/tangential feasibility screen (1e-13, the second PR2 trigger) since the attachment.
+    std::vector<std::uint32_t> srd_stats{};     ///< Task 121 (VOLUMETRIC_WALL_SRD builds only): the six cumulative device counters of the redistribution (non-positive mean, singular B, non-finite reconstruction, limiter entries, negative f', non-finite f'). Empty otherwise.
+    std::vector<double> facet_law{};            ///< V2, VOLUMETRIC_WALL_ROUGH builds only: the (K0_a, C_a) per facet as uploaded to the device (read back). Empty otherwise.
     std::uint32_t clamp_count{};                ///< Native clamp activations since construction.
 };
 
@@ -244,6 +285,10 @@ public:
     /// @throws std::invalid_argument on a structural failure (named), after the full report is formed
     /// @note `input` is referenced, not copied: it must outlive the embedding (the LBM attaches both within one call).
     VolumetricWallEmbedding(const VolumetricWallNativeInput& input, const std::vector<std::uint8_t>& solid);
+    /// @brief Task 105: the same with cells that are R cells by declaration (the E cells of an open-x attachment), added to
+    /// T + S before the closure. An empty list gives exactly the constructor above.
+    /// @param forced_r mesh cells that must be R cells
+    VolumetricWallEmbedding(const VolumetricWallNativeInput& input, const std::vector<std::uint8_t>& solid, const std::vector<std::uint32_t>& forced_r);
 
     const NativeOwnershipReport& report() const { return report_; }
     const NativeDirections& directions() const { return directions_; }
@@ -281,6 +326,7 @@ private:
 
     const VolumetricWallNativeInput& in_;
     std::vector<std::uint8_t> solid_{};
+    std::vector<std::uint32_t> forced_r_{};
     NativeDirections directions_{};
     NativeAddresses addresses_;
     std::vector<std::uint64_t> lattice_of_cell_{};
@@ -291,6 +337,62 @@ private:
     std::map<std::uint64_t, bool> pure_cache_{};
     NativeOwnershipReport report_{};
     std::uint64_t cut_cells_{}, t_cells_{}, s_cells_{}, closure_added_{};
+};
+
+/// @brief V2 (task 105): the declaration of the open-x boundary (VOLUMETRIC_WALL_OPEN_X). Contract:
+/// research/wall_model/v2/open_terrain/e2/V2_OPEN_DOMAIN_LEDGER_CONTRACT_E2_2026-11-10.md Sections 3-4, 6c, 7; CPU reference
+/// open_terrain_model.py (CharacteristicBoundary, OutletRelaxation, InletTarget). Open in x, periodic in y, flat aprons at
+/// x = 0 (inlet) and x = Nx - 1 (outlet), F = 0. All values are lattice units.
+struct VolumetricWallOpenX {
+    std::array<double, 3> inlet_velocity{};     ///< Steady inlet target U_b (u_x > 0: inflow through x = 0).
+    bool hard_inlet{ true };                    ///< True: the hard algebraic limit (u = U_b imposed, d_t rho = -L_plus/c^2); false: the relaxation K_u.
+    double inlet_relaxation{};                  ///< K_u in [0, 1) for the relaxed inlet; unused by the hard inlet.
+    double outlet_sigma{};                      ///< sigma > 0 of K_p = sigma (1 - Ma^2) c / L_x (K_p = 0 is refused, contract 7.4).
+    double outlet_mach{};                       ///< Ma in [0, 1) of K_p (declared; OC-01/OC4 use U/c exactly).
+    double outlet_length{};                     ///< L_x > 0 of K_p (declared; OC-01 and OC4 use the cut length Nx - 2).
+    double outlet_rho_inf{ 1.0 };               ///< rho_inf > 0 of the outlet relaxation.
+    double initial_rho{ 1.0 };                  ///< The E state of every E cell at the attachment (rho_b > 0).
+    std::array<double, 3> initial_velocity{};   ///< ... and its velocity (it must pass the 7.6 refusals).
+    /// @brief Finite inputs, the ranges above, a finite K_p > 0; the initial state is checked by the layout (refusals 7.6).
+    /// @throws std::invalid_argument naming the first failed check
+    void validate() const;
+    /// @brief K_p = sigma (1 - Ma^2) c / L_x with c = 1/sqrt(3) (the reference's expression order).
+    double outlet_relaxation() const;
+};
+
+/// @brief V2 (task 105): the open-x classification of a periodic VWNAT01 container (the reference's OpenLayout and
+/// WrapCheck, open_terrain_model.py). E cells are the mesh cells with x = 0 or x = Nx - 1 (all V = 1); exterior facets are
+/// the facets whose facet point (sample point - n/2) lies in an E column (all flat, n = +-z); each has exactly one adjacent E
+/// cell (same column, centroid z = sample z). Every table entry across the x wrap must touch only E cells or exterior rows
+/// (fail closed); no W entry may touch an exterior facet; exterior rows start with zero pending.
+class VolumetricWallOpenLayout {
+public:
+    /// @param input validated VWNAT01 input (referenced only during construction)
+    /// @throws std::invalid_argument naming the first failed rule
+    explicit VolumetricWallOpenLayout(const VolumetricWallNativeInput& input);
+    std::int32_t nx() const { return nx_; }
+    /// @brief E slot of a lattice position: side*(Ny*Nz) + y + Ny*z, side 0 = inlet (x = 0), 1 = outlet (x = Nx - 1).
+    std::uint32_t slots() const { return 2u*static_cast<std::uint32_t>(ny_)*static_cast<std::uint32_t>(nz_); }
+    const std::vector<std::uint32_t>& e_cells() const { return e_cells_; }       ///< Mesh indices of the E cells.
+    const std::vector<std::uint32_t>& e_slot() const { return e_slot_; }         ///< Slot of every E cell (e_cells order).
+    const std::vector<std::int32_t>& e_side() const { return e_side_; }          ///< Outward normal sign s of every E cell: -1 inlet, +1 outlet.
+    const std::vector<std::uint32_t>& e_inward() const { return e_inward_; }     ///< Mesh cells b-1, b-2 of every E cell (2 per E cell).
+    const std::vector<std::int64_t>& slot_of_cell() const { return slot_of_cell_; } ///< Slot of every mesh cell, -1 for interior cells.
+    const std::vector<std::uint8_t>& exterior_facet() const { return exterior_facet_; }
+    const std::vector<std::int64_t>& e_cell_of_facet() const { return e_cell_of_facet_; } ///< Mesh E cell next to an exterior facet, -1 otherwise.
+    const std::vector<std::uint8_t>& exterior_row() const { return exterior_row_; }
+    /// @brief The same input with the gradient rows of the E cells set to zero weights (contract O3: no gradient at E cells,
+    /// so no arm term has an E donor and no sample reads an E gradient). Stencils and sizes are unchanged.
+    VolumetricWallNativeInput without_e_gradients(const VolumetricWallNativeInput& input) const;
+    /// @brief One line per count (E cells, exterior facets and rows, wrap entries per table) for the attachment log.
+    std::string text() const;
+private:
+    std::int32_t nx_{}, ny_{}, nz_{};
+    std::vector<std::uint32_t> e_cells_{}, e_slot_{}, e_inward_{};
+    std::vector<std::int32_t> e_side_{};
+    std::vector<std::int64_t> slot_of_cell_{}, e_cell_of_facet_{};
+    std::vector<std::uint8_t> exterior_facet_{}, exterior_row_{};
+    std::uint64_t wrap_d_{}, wrap_g_{}, wrap_r_{}, wrap_s_{}, wrap_l_{};
 };
 
 }  // namespace fluidx3d::experimental

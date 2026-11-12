@@ -1393,7 +1393,14 @@ double vw_weight(const int d, const global int* c) { // rest weight of lexicogra
 // populations; F: the force density (the float32 values widened). p = feq + (1 - omega) fneq_RR + Phi/2 with
 // u = (j + F/2)/rho, B = 1 + 3cu + 9/2 cu^2 - 3/2 uu + 9/2 (cu^3 - cu uu), feq = w rho B, Phi = 3 (c.F - u.F) w B,
 // A = sum c c (f + Phi/2) - rho/3 I - rho u u, fneq = w [9/2 (cAc - trA/3) + 27/2 (cu cAc - (cu trA + 2 u.A.c)/3)].
-void vw_rr27(const double* f, const double* cx, const double* cy, const double* cz, const double* wq, const double omega, const double3 F, double* p) {
+// V2 (VOLUMETRIC_WALL_SGS): the relaxation uses the per-cell rate of the static Smagorinsky closure (research/wall_model/v2/
+// sgs_m1/e2/V2_SGS_01_M1_DERIVATION_E2_2026-11-10.md, (C2)): Q = A:A of the full A, tau = tau0/2 + sqrt(tau0^2 + k sqrt(Q)/rho)/2,
+// tau0 = 1/omega, wl = 1/tau; k = sgs_k = 18 sqrt(2) (C Delta)^2 with Delta = 1. k == 0 uses omega exactly. Phi is unchanged.
+void vw_rr27)+"("+R(const double* f, const double* cx, const double* cy, const double* cz, const double* wq, const double omega, const double3 F, double* p
+)+"#ifdef VOLUMETRIC_WALL_SGS"+R(
+ , const double sgs_k // the closure constant k (0: the rate omega, explicit branch below)
+)+"#endif"+R( // VOLUMETRIC_WALL_SGS
+)+") {"+R(
  double rho=0.0, jx=0.0, jy=0.0, jz=0.0;
  for(uint i=0u; i<def_velocity_set; i++) { rho+=f[i]; jx+=f[i]*cx[i]; jy+=f[i]*cy[i]; jz+=f[i]*cz[i]; }
  const double ux=(jx+0.5*F.x)/rho, uy=(jy+0.5*F.y)/rho, uz=(jz+0.5*F.z)/rho;
@@ -1411,13 +1418,25 @@ void vw_rr27(const double* f, const double* cx, const double* cy, const double* 
  const double Axx=sxx-rho/3.0-rho*ux*ux, Ayy=syy-rho/3.0-rho*uy*uy, Azz=szz-rho/3.0-rho*uz*uz;
  const double Axy=sxy-rho*ux*uy, Axz=sxz-rho*ux*uz, Ayz=syz-rho*uy*uz;
  const double trA=Axx+Ayy+Azz;
+)+"#ifdef VOLUMETRIC_WALL_SGS"+R(
+ double wl=omega; // k == 0: omega exactly (the V1 rate)
+ if(sgs_k!=0.0) {
+  const double Q=Axx*Axx+Ayy*Ayy+Azz*Azz+2.0*(Axy*Axy+Axz*Axz+Ayz*Ayz); // A:A of the symmetric full A
+  const double tau0=1.0/omega;
+  wl=1.0/(0.5*tau0+0.5*sqrt(tau0*tau0+sgs_k*sqrt(Q)/rho));
+ }
+)+"#endif"+R( // VOLUMETRIC_WALL_SGS
  for(uint i=0u; i<def_velocity_set; i++) {
   const double cu=cx[i]*ux+cy[i]*uy+cz[i]*uz;
   const double Acx=Axx*cx[i]+Axy*cy[i]+Axz*cz[i], Acy=Axy*cx[i]+Ayy*cy[i]+Ayz*cz[i], Acz=Axz*cx[i]+Ayz*cy[i]+Azz*cz[i]; // A c
   const double cAc=cx[i]*Acx+cy[i]*Acy+cz[i]*Acz, uAc=ux*Acx+uy*Acy+uz*Acz;
   const double second=cAc-trA/3.0, third=cu*cAc-(cu*trA+2.0*uAc)/3.0;
   const double fneq=wq[i]*(4.5*second+13.5*third);
+)+"#ifdef VOLUMETRIC_WALL_SGS"+R(
+  p[i]=feq[i]+(1.0-wl)*fneq+0.5*phi[i];
+)+"#else"+R( // VOLUMETRIC_WALL_SGS
   p[i]=feq[i]+(1.0-omega)*fneq+0.5*phi[i];
+)+"#endif"+R( // VOLUMETRIC_WALL_SGS
  }
 }
 void vw_lex_tables(const global int* c, double* cx, double* cy, double* cz, double* wq) { // the lexicographic directions and double weights of the wall kernels
@@ -1426,6 +1445,18 @@ void vw_lex_tables(const global int* c, double* cx, double* cy, double* cz, doub
 bool vw_finite(const double x) { // bit test: the device program is built with -cl-finite-math-only, so isfinite is not trusted
  return ((as_ulong(x)>>52)&0x7FFul)!=0x7FFul;
 }
+)+"#ifdef VOLUMETRIC_WALL_OPEN_X"+R(
+// Task 105: feq3 of one E state es = (rho_b, ux, uy, uz) in the caller's direction order (open_terrain_model.py e_populations:
+// Equilibrium.parts at F = 0): p_i = w_i rho_b B_i, B = 1 + 3 cu + 9/2 cu^2 - 3/2 uu + 9/2 (cu^3 - cu uu).
+void vw_open_feq3(const global double* es, const double* cx, const double* cy, const double* cz, const double* wq, double* p) {
+ const double rb=es[0], ux=es[1], uy=es[2], uz=es[3];
+ const double uu=ux*ux+uy*uy+uz*uz;
+ for(uint i=0u; i<def_velocity_set; i++) {
+  const double cu=cx[i]*ux+cy[i]*uy+cz[i]*uz;
+  p[i]=wq[i]*rb*(1.0+3.0*cu+4.5*cu*cu-1.5*uu+4.5*(cu*cu*cu-cu*uu));
+ }
+}
+)+"#endif"+R( // VOLUMETRIC_WALL_OPEN_X
 )+"#endif"+R( // VOLUMETRIC_WALL_RR27
 kernel void vw_load(const uint rcells, const global ulong* cells, const global int* fx2lex, const global int* c, const global fpxx* fi, const ulong t, global double* f, global float* gpre) { // level-t states of the R cells: actual stored g (gpre) and f = fl64(w + g)
  const uint r=get_global_id(0); if(r>=rcells) return;
@@ -1437,6 +1468,12 @@ kernel void vw_collide)+"("+R(const uint rcells, const double omega, const globa
 )+"#ifdef VOLUME_FORCE"+R(
  , const float fx, const float fy, const float fz // task 43: the uniform force density of the ordinary kernel (the same float values), given at every dispatch
 )+"#endif"+R( // VOLUME_FORCE
+)+"#ifdef VOLUMETRIC_WALL_SGS"+R(
+ , const double sgs_k // V2: the SGS closure constant k of vw_rr27 (the last argument)
+)+"#endif"+R( // VOLUMETRIC_WALL_SGS
+)+"#ifdef VOLUMETRIC_WALL_OPEN_X"+R(
+ , const global int* eslot_r, const global double* estate // task 105: the E slot of every R cell (-1 interior) and the current E state
+)+"#endif"+R( // VOLUMETRIC_WALL_OPEN_X
 )+") {"+R( // BGK in FP64 (vw64_collide); the field cache of R cells gets the level-t rho and physical u
  const uint a=get_global_id(0); if(a>=rcells) return;
 )+"#ifdef VOLUMETRIC_WALL_RR27"+R(
@@ -1449,13 +1486,24 @@ kernel void vw_collide)+"("+R(const uint rcells, const double omega, const globa
 )+"#else"+R( // VOLUME_FORCE
   const double3 Fr=(double3)(0.0);
 )+"#endif"+R( // VOLUME_FORCE
-  vw_rr27(fl, cx, cy, cz, wq, omega, Fr, pl);
+)+"#ifdef VOLUMETRIC_WALL_OPEN_X"+R(
+  const bool e_cell=eslot_r[a]>=0; // task 105: an E cell holds feq3 of the current E state (contract A4/7.5), not a collision of its loaded state
+  if(e_cell) vw_open_feq3(estate+4u*(uint)eslot_r[a], cx, cy, cz, wq, pl); else
+)+"#endif"+R( // VOLUMETRIC_WALL_OPEN_X
+  vw_rr27)+"("+R(fl, cx, cy, cz, wq, omega, Fr, pl
+)+"#ifdef VOLUMETRIC_WALL_SGS"+R(
+  , sgs_k
+)+"#endif"+R( // VOLUMETRIC_WALL_SGS
+  )+");"+R(
   double rr=0.0, jrx=0.0, jry=0.0, jrz=0.0, rf=0.0, jfx=0.0, jfy=0.0, jfz=0.0;
   for(uint i=0u; i<def_velocity_set; i++) { post[def_velocity_set*a+i]=pl[i]; rr+=pl[i]; jrx+=pl[i]*cx[i]; jry+=pl[i]*cy[i]; jrz+=pl[i]*cz[i]; rf+=fl[i]; jfx+=fl[i]*cx[i]; jfy+=fl[i]*cy[i]; jfz+=fl[i]*cz[i]; }
   const double3 upr=((double3)(jrx, jry, jrz)-0.5*Fr)/rr;
   fields[4u*a]=rr; vstore3(upr, 0, fields+4u*a+1u);
   const double3 upre=((double3)(jfx, jfy, jfz)+0.5*Fr)/rf; // the level-t physical velocity of the field cache
   const uxx nr=(uxx)cells[a]; rho[nr]=(float)rf; store3(u, nr, (float3)((float)upre.x, (float)upre.y, (float)upre.z));
+)+"#ifdef VOLUMETRIC_WALL_OPEN_X"+R(
+  if(e_cell) { rho[nr]=(float)rr; store3(u, nr, (float3)((float)upr.x, (float)upr.y, (float)upr.z)); } // task 105: the field cache of an E cell is its E state
+)+"#endif"+R( // VOLUMETRIC_WALL_OPEN_X
   return;
  }
 )+"#endif"+R( // VOLUMETRIC_WALL_RR27
@@ -1583,6 +1631,15 @@ double vw_affine_e(const int i, const global int* c, const double rb, const doub
  const double3 slope=3.0*ci+9.0*cub*ci-3.0*ub;
  return w*(rb*shape+drho*shape+rb*dot(slope, du));
 }
+)+"#ifdef VOLUMETRIC_WALL_T119"+R(
+double3 vw_affine_slope(const int i, const global int* c, const double rb, const double3 ub, const global double* gc) { // task 119 (section 15.11): the spatial gradient b of vw_affine_e (it is linear in the arm): w {shape grad rho + rho slope.(grad u)}, the RR27 bracket and slope of vw_affine_e
+ const double3 ci=convert_double3(vload3(i, c)); const double w=vw_weight(i, c);
+ const double cub=dot(ci, ub); const double ubb=dot(ub, ub);
+ const double shape=1.0+3.0*cub+4.5*cub*cub-1.5*ubb+4.5*(cub*cub*cub-cub*ubb);
+ const double3 slope=3.0*ci+9.0*cub*ci-3.0*ub+4.5*(3.0*cub*cub*ci-ubb*ci-2.0*cub*ub);
+ return w*(shape*vload3(def_velocity_set, gc)+rb*(slope.x*vload3(def_velocity_set+1u, gc)+slope.y*vload3(def_velocity_set+2u, gc)+slope.z*vload3(def_velocity_set+3u, gc)));
+}
+)+"#endif"+R( // VOLUMETRIC_WALL_T119
 kernel void vw_support(const uint scount, const global ulong* scells, const global int* fx2lex, const global int* c, const global fpxx* fi, const ulong t, const float fx, const float fy, const float fz, global double* spost, global double* sfields) { // after stream_collide of step t, before any wall store: the post-collision populations that store_f(n, ., t) wrote for the support cells, p = w + (double)g, and their rho and physical velocity
  const uint s=get_global_id(0); if(s>=scount) return;
  const uxx n=(uxx)scells[s]; uxx j[def_velocity_set]; neighbors(n, j);
@@ -1643,12 +1700,16 @@ kernel void vw_wall_affine(const uint facets, const double K, const global int* 
  }
  vstore3(J, a, impulse);
 }
-kernel void vw_stream_pending_affine(const uint owned, const uint rows, const global int* c, const global uint* odir, const global ulong* oaddr0, const global ulong* oaddr1, const ulong t,
+kernel void vw_stream_pending_affine)+"("+R(const uint owned, const uint rows, const global int* c, const global uint* odir, const global ulong* oaddr0, const global ulong* oaddr1, const ulong t,
  const global uint* doff, const global uint* di, const global double* dw, const global uint* ro, const global uint* ri, const global double* rw,
  const global double* post, const global double* Q, const global uint* wo, const global uint* wi, const global double* ww, const global double* vi,
  global double* snext, global fpxx* fi, global double* prestore,
  const global double* darm, const global int* dgrad, const global double* rarm, const global double* rsw, const global uint* ocell, const global int* ograd,
- const global double* fields, const global double* grad, const global double* ebar, global double* returned, global double* dinc) { // vw_stream_pending with the direct arm term and the centred scatter (R Q unchanged)
+ const global double* fields, const global double* grad, const global double* ebar, global double* returned, global double* dinc
+)+"#ifdef VOLUMETRIC_WALL_T119"+R(
+ , const global double* t119_wm, const global double* t119_out // task 119 (section 15.11): the stored owned first moment of every W entry; B0, a (3), L/S of every producer row (written by vw_wall_rr27 in the same update)
+)+"#endif"+R( // VOLUMETRIC_WALL_T119
+)+") {"+R( // vw_stream_pending with the direct arm term and the centred scatter (R Q unchanged)
  const uint id=get_global_id(0);
  if(id<owned) {
   double base=0.0, increment=0.0, back=0.0;
@@ -1670,7 +1731,15 @@ kernel void vw_stream_pending_affine(const uint owned, const uint rows, const gl
   store(fi, addr, convert_float_rte(g));
  } else if(id<owned+rows) {
   const uint row=id-owned; double sum=0.0;
-  for(uint z=wo[row]; z<wo[row+1u]; z++) sum+=ww[z]*Q[wi[z]]/vi[wi[z]];
+  for(uint z=wo[row]; z<wo[row+1u]; z++) {
+   sum+=ww[z]*Q[wi[z]]/vi[wi[z]];
+)+"#ifdef VOLUMETRIC_WALL_T119"+R(
+   { // task 119 (section 15.11): the destination amount w B0 + a.m - w L/S of this owned part (zero for a producer row without W: t119_out is 0 there)
+    const uint p=wi[z]; const double3 ap=(double3)(t119_out[5u*p+1u], t119_out[5u*p+2u], t119_out[5u*p+3u]);
+    sum+=ww[z]*t119_out[5u*p]+dot(ap, vload3(z, t119_wm))-ww[z]*t119_out[5u*p+4u];
+   }
+)+"#endif"+R( // VOLUMETRIC_WALL_T119
+  }
   snext[row]=sum;
  }
 }
@@ -1679,8 +1748,15 @@ kernel void vw_stream_pending_affine(const uint owned, const uint rows, const gl
 // level-t state (load_f, f = w + g), with the same function vw_rr27: the gradient reads the FP64 post-collision values of the
 // reference instead of the FP32 values stream_collide stores. Writes spost (q per support cell, lexicographic) and sfields
 // (rho_p, u_p = (sum c p - F/2)/rho_p). It reads only the level-t load set of each support cell, which stream_collide reads too.
-kernel void vw_support_rr27(const uint scount, const global ulong* scells, const global int* fx2lex, const global int* c, const global fpxx* fi, const ulong t, const double omega,
- const float fx, const float fy, const float fz, global double* spost, global double* sfields) {
+kernel void vw_support_rr27)+"("+R(const uint scount, const global ulong* scells, const global int* fx2lex, const global int* c, const global fpxx* fi, const ulong t, const double omega,
+ const float fx, const float fy, const float fz, global double* spost, global double* sfields
+)+"#ifdef VOLUMETRIC_WALL_SGS"+R(
+ , const double sgs_k // V2: the SGS closure constant k of vw_rr27 (the last argument)
+)+"#endif"+R( // VOLUMETRIC_WALL_SGS
+)+"#ifdef VOLUMETRIC_WALL_OPEN_X"+R(
+ , const global int* eslot_s, const global double* estate // task 105: the E slot of every support cell (-1 interior) and the current E state
+)+"#endif"+R( // VOLUMETRIC_WALL_OPEN_X
+)+") {"+R(
  const uint s=get_global_id(0); if(s>=scount) return;
  const uxx n=(uxx)scells[s]; uxx j[def_velocity_set]; neighbors(n, j);
  float fhn[def_velocity_set]; load_f(n, fhn, fi, j, t);
@@ -1688,7 +1764,14 @@ kernel void vw_support_rr27(const uint scount, const global ulong* scells, const
  vw_lex_tables(c, cx, cy, cz, wq);
  for(uint k=0u; k<def_velocity_set; k++) { const int d=fx2lex[k]; fl[(uint)d]=wq[(uint)d]+(double)fhn[k]; }
  const double3 F=(double3)((double)fx, (double)fy, (double)fz);
- vw_rr27(fl, cx, cy, cz, wq, omega, F, pl);
+)+"#ifdef VOLUMETRIC_WALL_OPEN_X"+R(
+ if(eslot_s[s]>=0) vw_open_feq3(estate+4u*(uint)eslot_s[s], cx, cy, cz, wq, pl); else // task 105: an E support cell gives feq3 of the current E state
+)+"#endif"+R( // VOLUMETRIC_WALL_OPEN_X
+ vw_rr27)+"("+R(fl, cx, cy, cz, wq, omega, F, pl
+)+"#ifdef VOLUMETRIC_WALL_SGS"+R(
+ , sgs_k
+)+"#endif"+R( // VOLUMETRIC_WALL_SGS
+ )+");"+R(
  double rho=0.0, jx=0.0, jy=0.0, jz=0.0;
  for(uint d=0u; d<def_velocity_set; d++) { spost[def_velocity_set*s+d]=pl[d]; rho+=pl[d]; jx+=pl[d]*cx[d]; jy+=pl[d]*cy[d]; jz+=pl[d]*cz[d]; }
  const double3 up=((double3)(jx, jy, jz)-0.5*F)/rho;
@@ -1699,12 +1782,44 @@ kernel void vw_support_rr27(const uint scount, const global ulong* scells, const
 // wall-extrapolated even reference rho_w = rho_s - 1/2 n.S[L rho_p], u_w = P[S u_p - 1/2 S[L u_p] n]; ret = v B(rho_w, u_w) - I
 // - K rho_s phi.u_s; ONE delta per facet over all rows; Q = ret + v delta; J = sum c (Q + I); the prism mean ebar of the
 // feq3-Taylor shape. rho_w non-finite or <= 0 increments wfail (no clamp; the run is invalid). Captures rho_w, u_w and delta.
-kernel void vw_wall_rr27(const uint facets, const double K, const global int* c, const global uint* fo, const global uint* rd, const global double* vi, const global double* normals,
+kernel void vw_wall_rr27)+"("+R(const uint facets, const double K, const global int* c, const global uint* fo, const global uint* rd, const global double* vi, const global double* normals,
  const global uint* so, const global uint* si, const global double* sw, const global uint* sgrad, const global uint* go, const global uint* gi, const global double* gw,
  const global double* post, const global double* fields, const global double* s, global double* incoming, global double* Q, global double* impulse, const global double* phi,
- const global double* garm, const global uint* gdon, const global double* grad, global double* ebar, global double* wstate, global double* delta_out, global uint* wfail) {
+ const global double* garm, const global uint* gdon, const global double* grad, global double* ebar, global double* wstate, global double* delta_out, global uint* wfail
+)+"#ifdef VOLUMETRIC_WALL_ROUGH"+R(
+ , const global double* facet_law // V2: (K0_a, C_a) per facet (the last argument); K_a = K0_a + 3 C_a |u_s,a|, K_a = K0_a exactly where C_a == 0
+)+"#endif"+R( // VOLUMETRIC_WALL_ROUGH
+)+"#ifdef VOLUMETRIC_WALL_OPEN_X"+R(
+ , const global int* efacet // task 105: the R index of the E cell of every exterior facet, -1 for an interior facet (the last argument)
+)+"#endif"+R( // VOLUMETRIC_WALL_OPEN_X
+)+"#ifdef VOLUMETRIC_WALL_T119"+R(
+ , const global double* t119_delta, const global double* t119_wcol, const global double* t119_summ, global double* t119_out, global uint* t119_neg, global uint* t119_p1, const global double* t119_area // task 119 (section 15.11), the last arguments: delta_j of every G entry (3), the stored W column sum and sum_b m_b (3) of every row, the B0, a (3), L/S output of every row (5), the count of rows with raw Q < 0, the count of facets outside the PR2 feasibility screen, the facet areas
+)+"#endif"+R( // VOLUMETRIC_WALL_T119
+)+") {"+R(
  const uint a=get_global_id(0); if(a>=facets) return;
  const uint NF3=3u*(def_velocity_set+4u);
+)+"#ifdef VOLUMETRIC_WALL_OPEN_X"+R(
+ if(efacet[a]>=0) { // task 105 (contract O3a): an exterior facet has no balance. Its rows absorb the gathers from the interior (kept as the
+  // incoming capture) and return Q*_r = v_r feq3_(c_r)(rho_b, u_b) of its E cell (the fields of that R cell: the sums of feq3 of the current E
+  // state, as the reference's fields(p)); no sample, friction, delta, scatter (rsw 0 on the host) or impulse; no wall-state count.
+  const uint e=(uint)efacet[a];
+  const double rb=fields[4u*e], ux=fields[4u*e+1u], uy=fields[4u*e+2u], uz=fields[4u*e+3u];
+  const double uu=ux*ux+uy*uy+uz*uz;
+  for(uint row=fo[a]; row<fo[a+1u]; row++) {
+   const int i=(int)rd[row]; const double w=vw_weight(i, c);
+   double sum=0.0;
+   for(uint z=go[row]; z<go[row+1u]; z++) { const uint st=gi[z]; sum+=gw[z]*(post[st]+dot(vload3(z, garm), vload3(st%def_velocity_set, grad+NF3*gdon[z]))); }
+   sum+=s[row];
+   incoming[row]=sum;
+   const double cu=(double)c[3*i]*ux+(double)c[3*i+1]*uy+(double)c[3*i+2]*uz;
+   Q[row]=vi[row]*w*rb*(1.0+3.0*cu+4.5*cu*cu-1.5*uu+4.5*(cu*cu*cu-cu*uu));
+   ebar[row]=0.0;
+  }
+  vstore3((double3)(0.0), a, impulse);
+  wstate[4u*a]=0.0; vstore3((double3)(0.0), 0, wstate+4u*a+1u); delta_out[a]=0.0;
+  return;
+ }
+)+"#endif"+R( // VOLUMETRIC_WALL_OPEN_X
  const double3 nrm=vload3(a, normals);
  double rho_s=0.0, drho=0.0; double3 uf=(double3)(0.0), du=(double3)(0.0);
  for(uint z=so[a]; z<so[a+1u]; z++) {
@@ -1714,9 +1829,17 @@ kernel void vw_wall_rr27(const uint facets, const double K, const global int* c,
   du+=sw[z]*(double3)(dot(nrm, vload3(def_velocity_set+1u, gs)), dot(nrm, vload3(def_velocity_set+2u, gs)), dot(nrm, vload3(def_velocity_set+3u, gs)));
  }
  const double3 us=uf-nrm*dot(uf, nrm); // friction at the sample
+)+"#ifdef VOLUMETRIC_WALL_ROUGH"+R(
+ const double Ca=facet_law[2u*a+1u];
+ const double Ka=Ca==0.0 ? facet_law[2u*a] : facet_law[2u*a]+3.0*Ca*sqrt(us.x*us.x+us.y*us.y+us.z*us.z); // V2: the C_a == 0 facets use K0_a directly (no |u_s|)
+)+"#endif"+R( // VOLUMETRIC_WALL_ROUGH
  const double rho_w=rho_s-0.5*drho;
  double3 uw=uf-0.5*du; uw-=nrm*dot(uw, nrm); // the even reference
+)+"#ifdef VOLUMETRIC_WALL_ROUGH"+R(
+ if(!(vw_finite(rho_w)&&rho_w>0.0&&vw_finite(uw.x)&&vw_finite(uw.y)&&vw_finite(uw.z)&&vw_finite(Ka))) atomic_inc(wfail); // V2: a non-finite K_a (e.g. an overflow of finite inputs) counts as a wall-state failure
+)+"#else"+R( // VOLUMETRIC_WALL_ROUGH
  if(!(vw_finite(rho_w)&&rho_w>0.0&&vw_finite(uw.x)&&vw_finite(uw.y)&&vw_finite(uw.z))) atomic_inc(wfail);
+)+"#endif"+R( // VOLUMETRIC_WALL_ROUGH
  const double uw2=dot(uw, uw);
  double inc[def_velocity_set], ret[def_velocity_set]; double denom=0.0, difference=0.0;
  const uint begin=fo[a], end=fo[a+1u];
@@ -1728,21 +1851,230 @@ kernel void vw_wall_rr27(const uint facets, const double K, const global int* c,
   inc[k]=sum; incoming[row]=sum;
   const double cuw=dot(ci, uw);
   const double even=2.0*w*rho_w*(1.0+4.5*cuw*cuw-1.5*uw2);
+)+"#ifdef VOLUMETRIC_WALL_ROUGH"+R(
+  ret[k]=vi[row]*even-sum-Ka*rho_s*dot(vload3(row, phi), us);
+)+"#else"+R( // VOLUMETRIC_WALL_ROUGH
   ret[k]=vi[row]*even-sum-K*rho_s*dot(vload3(row, phi), us);
+)+"#endif"+R( // VOLUMETRIC_WALL_ROUGH
   denom+=vi[row]; difference+=sum-ret[k];
   double he=0.0, H=0.0;
   for(uint z=go[row]; z<go[row+1u]; z++) { const uint b=gi[z]/def_velocity_set; he+=gw[z]*vw_affine_e(i, c, fields[4u*b], vload3(0, fields+4u*b+1u), vload3(z, garm), grad+NF3*gdon[z]); H+=gw[z]; }
   ebar[row]=he/H;
+)+"#ifdef VOLUMETRIC_WALL_T119"+R(
+  { // task 119 (section 15.11): the whole-prism mean. A row with a stored W gets ebar = he/H + L/S and the destination terms; a row without W is untouched (ebar = he/H exactly, outputs 0)
+   const double Wc=t119_wcol[row]; t119_out[5u*row]=0.0; t119_out[5u*row+1u]=0.0; t119_out[5u*row+2u]=0.0; t119_out[5u*row+3u]=0.0; t119_out[5u*row+4u]=0.0;
+   if(Wc>0.0) {
+    double3 asum=(double3)(0.0); double b0num=0.0;
+    for(uint z=go[row]; z<go[row+1u]; z++) { const uint b=gi[z]/def_velocity_set; const double3 bj=vw_affine_slope(i, c, fields[4u*b], vload3(0, fields+4u*b+1u), grad+NF3*gdon[z]); asum+=gw[z]*bj; b0num+=gw[z]*dot(bj, vload3(z, t119_delta)); }
+    const double3 aj=asum/H; const double B0=-b0num/H;
+    const double Lj=Wc*B0+dot(aj, vload3(row, t119_summ)); const double Sj=H+Wc;
+    ebar[row]=he/H+Lj/Sj;
+    t119_out[5u*row]=B0; t119_out[5u*row+1u]=aj.x; t119_out[5u*row+2u]=aj.y; t119_out[5u*row+3u]=aj.z; t119_out[5u*row+4u]=Lj/Sj;
+   }
+  }
+)+"#endif"+R( // VOLUMETRIC_WALL_T119
  }
  const double delta=difference/denom; double3 J=(double3)(0.0);
  for(uint row=begin; row<end; row++) {
   const uint k=row-begin; const double3 ci=convert_double3(vload3((int)rd[row], c));
   const double v=ret[k]+vi[row]*delta; Q[row]=v; J+=(v+inc[k])*ci;
+)+"#ifdef VOLUMETRIC_WALL_T119"+R(
+  if(v<0.0) atomic_inc(t119_neg); // the PR2 projection trigger (raw outgoing Q < 0): the engine has no projection, the host refuses on a nonzero count
+)+"#endif"+R( // VOLUMETRIC_WALL_T119
  }
+)+"#ifdef VOLUMETRIC_WALL_T119"+R(
+ { // the second PR2 trigger, the mass and tangential feasibility of the raw Q (e1_pr2_run.py FacetProjector.screen, GATE 1e-13): mass_rel = |sum Q - sum I| / sum I; tan_rel = max(|V.t1|, |V.t2|) / S_a with V = sum c (Q + I) - T, T = -K rho_s area/3 u_s, S_a = sum |c| (|Q| + |I|); t1 = unit(n x a), t2 = n x t1 (a = x unless |n_x| >= 0.9, then y)
+  double sumQ=0.0, sumI=0.0, Sa=0.0; double3 V=(double3)(0.0);
+  for(uint row=begin; row<end; row++) { const double3 ci=convert_double3(vload3((int)rd[row], c)); sumQ+=Q[row]; sumI+=incoming[row]; V+=ci*(Q[row]+incoming[row]); Sa+=length(ci)*(fabs(Q[row])+fabs(incoming[row])); }
+)+"#ifdef VOLUMETRIC_WALL_ROUGH"+R(
+  V+=(Ka*rho_s*t119_area[a]/3.0)*us;
+)+"#else"+R( // VOLUMETRIC_WALL_ROUGH
+  V+=(K*rho_s*t119_area[a]/3.0)*us;
+)+"#endif"+R( // VOLUMETRIC_WALL_ROUGH
+  const double3 axis=fabs(nrm.x)<0.9 ? (double3)(1.0, 0.0, 0.0) : (double3)(0.0, 1.0, 0.0); const double3 t1=normalize(cross(nrm, axis)); const double3 t2=cross(nrm, t1);
+  const double mass_rel=fabs(sumQ-sumI)/fmax(sumI, 1e-300); const double tan_rel=fmax(fabs(dot(V, t1)), fabs(dot(V, t2)))/fmax(Sa, 1e-300);
+  if(!(mass_rel<=1e-13&&tan_rel<=1e-13)) atomic_inc(t119_p1); // not finite counts too
+ }
+)+"#endif"+R( // VOLUMETRIC_WALL_T119
  vstore3(J, a, impulse);
  wstate[4u*a]=rho_w; vstore3(uw, 0, wstate+4u*a+1u); delta_out[a]=delta;
 }
+)+"#ifdef VOLUMETRIC_WALL_OPEN_X"+R(
+// Task 105: the isothermal characteristic (LODI) update of the E state (contract Section 7; open_terrain_model.py
+// CharacteristicBoundary.update), one work item per E cell, in the load phase BEFORE stream_collide: it reads the level-n
+// pre-collision populations of the inward cells b-1, b-2 (load_f at t) and the current E state, and writes the next E state.
+// c = 1/sqrt(3), c2 = c c; d_n phi = (3 phi_b - 4 phi_(b-1) + phi_(b-2))/2 along the outward normal (sign s); outlet:
+// L_minus = K_p c2 (rho_b - rho_inf), L_v = u_n d_n v, L_w = u_n d_n w; inlet hard: rho' = rho_b - L_plus/c2, u' = U; inlet
+// relaxed: L_minus = L_plus - 2 rho_b c K_u (u_n - s U_x), L_v = K_u (v - U_y), L_w = K_u (w - U_z). The refusals 7.6 of the
+// NEW state (finite, rho > 0, outlet u_n >= 0, inlet u_n <= 0, |u_n| < c) increment fail (no clamp; any count invalidates the run).
+// Task 108: the sets are closed at zero speed. At u_n = 0 the two transverse velocity waves have zero speed (isothermal: no
+// entropy wave) (L_v = L_w = 0 at the
+// outlet, the relaxed inlet prescribes them), so no transverse inflow data are missing; wrong-sign flow stays refused.
+kernel void vw_open_state(const uint ecount, const global ulong* elattice, const global ulong* einward, const global int* eside, const global uint* eslot,
+ const global int* fx2lex, const global int* c, const global fpxx* fi, const ulong t, const global double* estate, global double* estate_next, global uint* fail,
+ const double K_p, const double rho_inf, const uint hard, const double K_u, const double Ux, const double Uy, const double Uz) {
+ const uint k=get_global_id(0); if(k>=ecount) return;
+ const double cs=1.0/sqrt(3.0), c2=cs*cs, s=(double)eside[k];
+ const global double* es=estate+4u*eslot[k];
+ const double rho_b=es[0], ux_b=es[1], uy_b=es[2], uz_b=es[3];
+ const double un_b=s*ux_b;
+ double rho_i[2], ux_i[2], uy_i[2], uz_i[2];
+ for(uint m=0u; m<2u; m++) { // the level-n fields of b-1 and b-2: rho = sum f, u = (sum c f)/rho (F = 0), lexicographic sums as the reference
+  const uxx n=(uxx)einward[2u*k+m]; uxx j[def_velocity_set]; neighbors(n, j);
+  float fhn[def_velocity_set]; load_f(n, fhn, fi, j, t);
+  double gl[def_velocity_set]; // task 125: the SHIFTED stored populations g = f - w (exact identities sum w = 1, sum c w = 0): rho = 1 + sum g, j = sum c g, so that an exact rest state gives exactly rho = 1, u = 0
+  for(uint q=0u; q<def_velocity_set; q++) { gl[(uint)fx2lex[q]]=(double)fhn[q]; }
+  double sg=0.0, jx=0.0, jy=0.0, jz=0.0;
+  for(uint d=0u; d<def_velocity_set; d++) { sg+=gl[d]; jx+=gl[d]*(double)c[3u*d]; jy+=gl[d]*(double)c[3u*d+1u]; jz+=gl[d]*(double)c[3u*d+2u]; }
+  const double r=1.0+sg;
+  rho_i[m]=r; ux_i[m]=jx/r; uy_i[m]=jy/r; uz_i[m]=jz/r;
+ }
+ // task 126: the OUTLET uses the first-order upwind difference D1 phi = phi_b - phi_1 (dx = dt = 1) for every outgoing derivative (rho, u_n, v, w);
+ // the INLET keeps the task-125 difference form 0.5 (3 (phi_b - phi_1) - (phi_1 - phi_2)) (algebraically 0.5 (3 phi_b - 4 phi_1 + phi_2)). A constant field gives exactly zero in both.
+ // Outgoing combination a = du_n + (c/rho) drho: a' = (1 - lambda) a_b + lambda a_1, lambda = u_n + c (frozen coefficients; convex for 0 <= u_n <= 1 - c).
+ const bool outlet_d1=(s>0.0);
+ const double d_rho=outlet_d1 ? (rho_b-rho_i[0]) : 0.5*(3.0*(rho_b-rho_i[0])-(rho_i[0]-rho_i[1]));
+ const double d_un=outlet_d1 ? (un_b-s*ux_i[0]) : 0.5*(3.0*(un_b-s*ux_i[0])-(s*ux_i[0]-s*ux_i[1]));
+ const double d_v=outlet_d1 ? (uy_b-uy_i[0]) : 0.5*(3.0*(uy_b-uy_i[0])-(uy_i[0]-uy_i[1]));
+ const double d_w=outlet_d1 ? (uz_b-uz_i[0]) : 0.5*(3.0*(uz_b-uz_i[0])-(uz_i[0]-uz_i[1]));
+ const double L_plus=(un_b+cs)*(c2*d_rho+rho_b*cs*d_un);
+ double L_minus=0.0, L_v=0.0, L_w=0.0, nr=0.0, nux=0.0, nuy=0.0, nuz=0.0;
+ bool relaxed=true;
+ if(s>0.0) { // outlet: the computed outgoing waves, the pressure relaxation for the incoming one
+  L_minus=K_p*c2*(rho_b-rho_inf); L_v=un_b*d_v; L_w=un_b*d_w;
+ } else if(hard!=0u) { // inlet, the hard algebraic limit (steady target)
+  relaxed=false; nr=rho_b-L_plus/c2; nux=Ux; nuy=Uy; nuz=Uz;
+ } else { // inlet, the relaxation K_u (steady target)
+  L_minus=L_plus-2.0*rho_b*cs*K_u*(un_b-s*Ux); L_v=K_u*(uy_b-Uy); L_w=K_u*(uz_b-Uz);
+ }
+ if(relaxed) {
+  nr=rho_b-(L_plus+L_minus)/(2.0*c2);
+  const double nun=un_b-(L_plus-L_minus)/(2.0*rho_b*cs);
+  nux=s*nun; nuy=uy_b-L_v; nuz=uz_b-L_w;
+ }
+ const double un_new=s*nux;
+ const double eps_sign=1e-13; // task 125: the registered numerical sign resolution of the admissibility (outlet fails below -eps_sign, inlet above +eps_sign); the E velocity itself is never clipped or snapped
+ const bool ok=vw_finite(nr)&&vw_finite(nux)&&vw_finite(nuy)&&vw_finite(nuz)&&nr>0.0&&(s>0.0 ? un_new>=-eps_sign : un_new<=eps_sign)&&fabs(un_new)<cs;
+ if(!ok) atomic_inc(fail);
+ global double* en=estate_next+4u*eslot[k];
+ en[0]=nr; en[1]=nux; en[2]=nuy; en[3]=nuz;
+}
+// Task 105: the stored E populations (contract 7.5; the reference's f^(n+1)[E] = feq3(E^(n+1))): the load set of every E cell at
+// level t holds g = fl32_RTE(feq3(E) - w) of the given E state (the vw_seed_initial convention: lexicographic feq3, FluidX3D slots
+// through lex2fx, the load_f addresses of parity t). Only the E cell itself reads these addresses (its own load set).
+kernel void vw_open_store(const uint ecount, const global ulong* elattice, const global uint* eslot, const global int* lex2fx, const global int* c,
+ const global double* estate, global fpxx* fi, const ulong t) {
+ const uint k=get_global_id(0); if(k>=ecount) return;
+ const uxx n=(uxx)elattice[k]; uxx j[def_velocity_set]; neighbors(n, j);
+ double cx[def_velocity_set], cy[def_velocity_set], cz[def_velocity_set], wq[def_velocity_set], p[def_velocity_set];
+ vw_lex_tables(c, cx, cy, cz, wq);
+ vw_open_feq3(estate+4u*eslot[k], cx, cy, cz, wq, p);
+ float fhn[def_velocity_set];
+ for(uint d=0u; d<def_velocity_set; d++) fhn[(uint)lex2fx[d]]=convert_float_rte(p[d]-wq[d]);
+ store(fi, index_f(n, 0u), fhn[0]); // the addresses of load_f(n, ., t)
+ for(uint i=1u; i<def_velocity_set; i+=2u) {
+  store(fi, index_f(n   , t%2ul ? i    : i+1u), fhn[i   ]);
+  store(fi, index_f(j[i], t%2ul ? i+1u : i   ), fhn[i+1u]);
+ }
+}
+)+"#endif"+R( // VOLUMETRIC_WALL_OPEN_X
 )+"#endif"+R( // VOLUMETRIC_WALL_RR27
+)+"#ifdef VOLUMETRIC_WALL_SRD"+R(
+// Task 121 (EXPERIMENTAL): the task-120 conservative state redistribution (MATHEMATICAL_MODEL section 15.12 revision 2) applied ONCE to the complete
+// level-t1 pre-collision populations after the transport and the pending arrivals of the step (the in-order queue has finished vw_stream_pending).
+// Input is the DECODED stored load set f = w + double(g) of every cell involved (every cell's level-t1 load set is complete after the wall step);
+// all arithmetic is FP64; the result is stored again as g' = fl32_RTE(f' - w) for the active cells only. Pending amounts and all inactive cells are not touched.
+// Three stages so that every Q mean and every stencil value is formed from the SAME pre-redistribution state: srd_means (all seeds), srd_recon (all seeds,
+// reads only decoded stored values and the means), srd_apply (writes the stored sets of the active cells). Directions are lexicographic inside the kernels.
+// stats: 0 non-finite or non-positive neighbourhood mean, 1 singular B, 2 non-finite reconstruction, 3 limiter entries (seed, direction) with theta < 1,
+// 4 redistributed population < 0, 5 non-finite redistributed population.
+void srd_load_lex(const uxx n, const global int* fx2lex, const global int* c, const global fpxx* fi, const ulong t1, double* f) { // decoded level-t1 load set of cell n, lexicographic
+ uxx j[def_velocity_set]; neighbors(n, j);
+ float fhn[def_velocity_set]; load_f(n, fhn, fi, j, t1);
+ for(uint k=0u; k<def_velocity_set; k++) { const int d=fx2lex[k]; f[d]=vw_weight(d, c)+(double)fhn[k]; }
+}
+kernel void srd_means(const uint seeds, const global ulong* lat, const global uint* estart, const global uint* ecell, const global double* ewv, const global double* vhat, const global int* fx2lex, const global int* c, const global fpxx* fi, const ulong t1, global double* qhat, global uint* stats) {
+ const uint s=get_global_id(0); if(s>=seeds) return;
+ double sum[def_velocity_set];
+ for(uint d=0u; d<def_velocity_set; d++) sum[d]=0.0;
+ for(uint e=estart[s]; e<estart[s+1u]; e++) {
+  double f[def_velocity_set]; srd_load_lex((uxx)lat[ecell[e]], fx2lex, c, fi, t1, f);
+  for(uint d=0u; d<def_velocity_set; d++) sum[d]+=ewv[e]*f[d];
+ }
+ for(uint d=0u; d<def_velocity_set; d++) {
+  const double q=sum[d]/vhat[s]; qhat[def_velocity_set*s+d]=q;
+  if(!(vw_finite(q)&&q>0.0)) atomic_inc(stats);
+ }
+}
+kernel void srd_recon(const uint seeds, const global ulong* lat, const global uint* estart, const global double* edelta, const global uint* sstart, const global uint* scell, const global double* sw, const global double* sd, const global int* sidx, const global double* bmat, const global double* swsum, const global double* qhat, const global int* fx2lex, const global int* c, const global fpxx* fi, const ulong t1, global double* rout, global uint* stats) {
+ const uint s=get_global_id(0); if(s>=seeds) return;
+ const uint Q=def_velocity_set;
+ double a[9]; for(uint i=0u; i<9u; i++) a[i]=bmat[9u*s+i];
+ uint piv[3]={0u, 1u, 2u}; bool singular=false;
+ for(uint k=0u; k<3u; k++) { // LU with partial pivoting (first maximum), as LAPACK getrf for a 3 x 3 matrix
+  uint p=k; double m=fabs(a[3u*k+k]);
+  for(uint i=k+1u; i<3u; i++) { if(fabs(a[3u*i+k])>m) { m=fabs(a[3u*i+k]); p=i; } }
+  if(!(m>0.0)) singular=true;
+  if(p!=k) { for(uint col=0u; col<3u; col++) { const double tmp=a[3u*k+col]; a[3u*k+col]=a[3u*p+col]; a[3u*p+col]=tmp; } const uint tp=piv[k]; piv[k]=piv[p]; piv[p]=tp; }
+  for(uint i=k+1u; i<3u; i++) { a[3u*i+k]=a[3u*i+k]/a[3u*k+k]; for(uint col=k+1u; col<3u; col++) a[3u*i+col]-=a[3u*i+k]*a[3u*k+col]; }
+ }
+ if(singular) atomic_inc(stats+1u);
+ double rhs[3*def_velocity_set];
+ for(uint i=0u; i<3u*Q; i++) rhs[i]=0.0;
+ for(uint t=sstart[s]; t<sstart[s+1u]; t++) { // sum over the stencil labels of w d (Q_k - Q_j); a seed label uses its mean, a singleton label its decoded stored f
+  double fk[def_velocity_set]; const int si=sidx[t];
+  if(si<0) srd_load_lex((uxx)lat[scell[t]], fx2lex, c, fi, t1, fk); else { for(uint d=0u; d<Q; d++) fk[d]=qhat[Q*(uint)si+d]; }
+  for(uint d=0u; d<Q; d++) { const double dq=fk[d]-qhat[Q*s+d]; for(uint ax=0u; ax<3u; ax++) rhs[Q*ax+d]+=sw[t]*sd[3u*t+ax]*dq; }
+ }
+ double sigma[3*def_velocity_set];
+ for(uint d=0u; d<Q; d++) {
+  const double b0=rhs[d]/swsum[s], b1=rhs[Q+d]/swsum[s], b2=rhs[2u*Q+d]/swsum[s];
+  const double bb[3]={b0, b1, b2};
+  const double y0=bb[piv[0]]; const double y1=bb[piv[1]]-a[3]*y0; const double y2=bb[piv[2]]-a[6]*y0-a[7]*y1;
+  const double x2=y2/a[8]; const double x1=(y1-a[5]*x2)/a[4]; const double x0=(y0-a[1]*x1-a[2]*x2)/a[0];
+  sigma[d]=x0; sigma[Q+d]=x1; sigma[2u*Q+d]=x2;
+ }
+ double theta[def_velocity_set];
+ for(uint d=0u; d<Q; d++) theta[d]=1.0;
+ for(uint e=estart[s]; e<estart[s+1u]; e++) {
+  for(uint d=0u; d<Q; d++) {
+   const double dd=edelta[3u*e]*sigma[d]+edelta[3u*e+1u]*sigma[Q+d]+edelta[3u*e+2u]*sigma[2u*Q+d];
+   if(dd<0.0) { const double r=qhat[Q*s+d]/(-dd); if(r<theta[d]) theta[d]=r; }
+  }
+ }
+ for(uint d=0u; d<Q; d++) { if(theta[d]<1.0) atomic_inc(stats+3u); }
+ for(uint e=estart[s]; e<estart[s+1u]; e++) {
+  for(uint d=0u; d<Q; d++) {
+   const double dd=edelta[3u*e]*sigma[d]+edelta[3u*e+1u]*sigma[Q+d]+edelta[3u*e+2u]*sigma[2u*Q+d];
+   const double r=qhat[Q*s+d]+theta[d]*dd;
+   rout[Q*e+d]=r;
+   if(!vw_finite(r)) atomic_inc(stats+2u);
+  }
+ }
+}
+kernel void srd_apply(const uint count, const global ulong* lat, const global uint* acell, const global double* acoef, const global uint* astart, const global uint* aentry, const global double* ew, const global double* rr, const global int* fx2lex, const global int* c, global fpxx* fi, const ulong t1, global uint* stats) {
+ const uint a=get_global_id(0); if(a>=count) return;
+ const uint Q=def_velocity_set;
+ const uxx n=(uxx)lat[acell[a]]; uxx j[def_velocity_set]; neighbors(n, j);
+ float fhn[def_velocity_set]; load_f(n, fhn, fi, j, t1);
+ double f[def_velocity_set];
+ for(uint k=0u; k<Q; k++) { const int d=fx2lex[k]; f[d]=vw_weight(d, c)+(double)fhn[k]; }
+ double sums[def_velocity_set];
+ for(uint d=0u; d<Q; d++) sums[d]=0.0;
+ for(uint z=astart[a]; z<astart[a+1u]; z++) { const uint e=aentry[z]; for(uint d=0u; d<Q; d++) sums[d]+=ew[e]*rr[Q*e+d]; }
+ float out[def_velocity_set];
+ for(uint k=0u; k<Q; k++) {
+  const int d=fx2lex[k]; const double fp=acoef[a]*f[d]+sums[d];
+  if(!vw_finite(fp)) atomic_inc(stats+5u); else if(fp<0.0) atomic_inc(stats+4u);
+  out[k]=convert_float_rte(fp-vw_weight(d, c));
+ }
+ store(fi, index_f(n, 0u), out[0]); // the same addresses load_f(n, t1) read: the parity-t1 load set of n
+ for(uint i=1u; i<Q; i+=2u) {
+  store(fi, index_f(n, t1%2ul ? i : i+1u), out[i]);
+  store(fi, index_f(j[i], t1%2ul ? i+1u : i), out[i+1u]);
+ }
+}
+)+"#endif"+R( // VOLUMETRIC_WALL_SRD
 )+"#endif"+R( // VOLUMETRIC_WALL
 )+"#ifdef SURFACE"+R(
 )+R(void load_f_outgoing(const uxx n, float* fon, const global fpxx* fi, const uxx* j, const ulong t) { // load outgoing DDFs, even: 1:1 like stream-out odd, odd: 1:1 like stream-out even
@@ -1900,6 +2232,9 @@ kernel void vw_wall_rr27(const uint facets, const double K, const global int* c,
 )+"#ifdef VOLUMETRIC_WALL_FP64_COLLISION"+R(
 	, const double vw_omega64 // task 57: the FP64 relaxation rate of the ordinary cells: the container's omega = 1/(3 nu + 1/2), the same double as vw_collide (before an attachment: 1/(3 nu + 1/2) of the LBM nu)
 )+"#endif"+R(
+)+"#ifdef VOLUMETRIC_WALL_SGS"+R(
+	, const double vw_sgs_k // V2: the SGS closure constant k of vw_rr27; parameter 10, the last one in every VOLUMETRIC_WALL build (lbm.hpp refuses the extensions listed below)
+)+"#endif"+R( // VOLUMETRIC_WALL_SGS
 )+"#ifdef FORCE_FIELD"+R(
 	, const global float* F // argument order is important
 )+"#endif"+R( // FORCE_FIELD
@@ -2194,7 +2529,11 @@ kernel void vw_wall_rr27(const uint facets, const double K, const global int* c,
 )+"#else"+R( // VOLUME_FORCE
 		const double3 Fd = (double3)(0.0);
 )+"#endif"+R( // VOLUME_FORCE
-		vw_rr27(fd, cdx, cdy, cdz, wd, vw_omega64, Fd, pd);
+		vw_rr27)+"("+R(fd, cdx, cdy, cdz, wd, vw_omega64, Fd, pd
+)+"#ifdef VOLUMETRIC_WALL_SGS"+R(
+		, vw_sgs_k
+)+"#endif"+R( // VOLUMETRIC_WALL_SGS
+		)+");"+R(
 )+"#ifdef UPDATE_FIELDS"+R(
 		{ // the level-t density and physical velocity (j + F/2)/rho of the field arrays
 			double rd=0.0, jdx=0.0, jdy=0.0, jdz=0.0;

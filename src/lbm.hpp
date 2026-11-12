@@ -93,6 +93,43 @@ enum enum_transfer_field { fi, rho_u_flags, flags, F, phi_massex_flags, gi, T, h
 #if defined(VOLUMETRIC_WALL_RR27)&&!defined(VOLUMETRIC_WALL)
 #error VOLUMETRIC_WALL_RR27 requires VOLUMETRIC_WALL
 #endif
+// V2 (2026-11-11): VOLUMETRIC_WALL_SGS (opt-in, off by default) gives the RR collision of vw_rr27 the per-cell rate of the
+// static Smagorinsky closure (research/wall_model/v2/sgs_m1/e2/V2_SGS_01_M1_DERIVATION_E2_2026-11-10.md; qualified in the
+// M1 reference: S/Q-L and D). The same rate acts in the R cells, the support cells and the ordinary cells. The closure
+// constant k is set with LBM::set_volumetric_wall_sgs before the attachment; k = 0 (the default) is the rate omega exactly.
+// SUBGRID stays refused with RR27. Without the macro the code is the V1 code.
+#if defined(VOLUMETRIC_WALL_SGS)&&!defined(VOLUMETRIC_WALL_RR27)
+#error VOLUMETRIC_WALL_SGS requires VOLUMETRIC_WALL_RR27
+#endif
+// V2 (2026-11-11): VOLUMETRIC_WALL_ROUGH (opt-in, off by default) gives the wall friction of vw_wall_rr27 the facetwise rough
+// law K_a = K0_a + 3 C_a |u_s,a| (research/wall_model/v2/rough_wall/e2/V2_ROUGH_ENGINE_PORT_PLAN_E2_2026-11-11.md; qualified
+// in the M1 reference: V2-RW-01). The law comes from the optional container section facet_friction (K0_a, C_a); a container
+// without it gives (K, 0) on every facet, i.e. the scalar friction K exactly. A container WITH facet_friction is refused in a
+// build without the macro. Without the macro the code is the V1/V2-SGS code.
+#if defined(VOLUMETRIC_WALL_ROUGH)&&!defined(VOLUMETRIC_WALL_RR27)
+#error VOLUMETRIC_WALL_ROUGH requires VOLUMETRIC_WALL_RR27
+#endif
+// Task 119 (2026-11-11, EXPERIMENTAL, isolated port; not part of the qualified V2): VOLUMETRIC_WALL_T119 (opt-in, off by default) adds the
+// whole-prism redistribution of research/wall_model/MATHEMATICAL_MODEL.md section 15.11 to the RR27 wall: the centring mean of the scatter
+// becomes the whole-prism mean (fluid and owned parts) and the pending amounts of the owned parts get their destination terms. It needs the
+// optional container sections t119_gdelta and t119_wmoment (a container with them is refused in a build without the macro, and the macro
+// build refuses a container without them). Closed x only: it is refused with VOLUMETRIC_WALL_OPEN_X. Without the macro the code is unchanged.
+#if defined(VOLUMETRIC_WALL_T119)&&!defined(VOLUMETRIC_WALL_RR27)
+#error VOLUMETRIC_WALL_T119 requires VOLUMETRIC_WALL_RR27
+#endif
+// Task 123: the former compile-time refusal of T119 with OPEN_X is replaced by a runtime refusal in set_volumetric_wall_affine (guarded compatibility: modified rows, G donors, gradient stencils and R destinations strictly interior).
+// V2 (task 105): VOLUMETRIC_WALL_OPEN_X (opt-in, off by default) opens the x axis of the wall build: E cells at x = 0 (inlet)
+// and x = Nx - 1 (outlet) hold feq3 of an FP64 E state that the isothermal characteristic (LODI) update advances; the
+// facets of the two E columns are exterior (no balance: they absorb the gathers from the interior and return v feq3 of the
+// adjacent E state). Contract: research/wall_model/v2/open_terrain/e2/V2_OPEN_DOMAIN_LEDGER_CONTRACT_E2_2026-11-10.md
+// Sections 3-4, 6c, 7; CPU reference open_terrain_model.py. The E cells are the mesh cells at x = 0 and Nx - 1 (no TYPE_E flag,
+// so EQUILIBRIUM_BOUNDARIES stays refused); the embedding makes every E cell an R cell, so vw_collide (and vw_support_rr27 for
+// stencil reads) give them feq3 and stream_collide never sees them. LBM::set_volumetric_wall_open_x declares the boundary
+// before the attachment.
+// Without the macro the code is the closed V2 code.
+#if defined(VOLUMETRIC_WALL_OPEN_X)&&!(defined(VOLUMETRIC_WALL_RR27)&&defined(VOLUMETRIC_WALL_FP64_COLLISION))
+#error VOLUMETRIC_WALL_OPEN_X requires VOLUMETRIC_WALL_RR27 and VOLUMETRIC_WALL_FP64_COLLISION (the E branch of the ordinary cells is in the FP64 RR27 path)
+#endif
 
 class LBM_Domain {
 private:
@@ -142,6 +179,42 @@ private:
 	Memory<double> vw_wstate, vw_delta; // task 98: rho_w, u_w (4 per facet) and the one-per-facet mass correction delta, written by vw_wall_affine (capture)
 	Memory<uint> vw_wfail; // task 98: count of facets with a non-finite or non-positive rho_w (no clamp; any count invalidates the step)
 #endif // VOLUMETRIC_WALL_RR27
+#ifdef VOLUMETRIC_WALL_SGS
+	double vw_sgs_k = 0.0; ///< V2: the SGS closure constant k of vw_rr27 (0: the rate omega); set before the attachment, given to the three kernels there
+#endif // VOLUMETRIC_WALL_SGS
+#ifdef VOLUMETRIC_WALL_ROUGH
+	Memory<double> vw_facet_law; ///< V2: (K0_a, C_a) per facet for vw_wall_rr27, from the container section facet_friction or (K, 0) for a container without it
+#endif // VOLUMETRIC_WALL_ROUGH
+#ifdef VOLUMETRIC_WALL_T119
+	Memory<double> vw_t119_delta, vw_t119_wcol, vw_t119_summ, vw_t119_wm, vw_t119_out; ///< task 119: delta_j per G entry (3); stored W column sum per row; sum_b m_b per row (3); owned first moment per W entry (3); B0, a (3), L/S per row (5, written by vw_wall_rr27)
+	Memory<uint> vw_t119_neg, vw_t119_p1; ///< task 119: count of row updates with raw Q < 0, and of facet updates outside the mass/tangential feasibility screen 1e-13 (the two PR2 projection triggers; the engine has no projection)
+#endif // VOLUMETRIC_WALL_T119
+#ifdef VOLUMETRIC_WALL_SRD
+	Memory<ulong> srd_lat; ///< task 121: lattice cell of every mesh cell
+	Memory<uint> srd_estart, srd_ecell, srd_sstart, srd_scell, srd_acell, srd_astart, srd_aentry, srd_stats; ///< task 121: CSR offsets and cells of the group entries, the stencil, the active cells, and the six device counters
+	Memory<int> srd_sidx; ///< task 121: seed index of every stencil cell or -1
+	Memory<double> srd_ewv, srd_ew, srd_edelta, srd_vhat, srd_sw, srd_sd, srd_b, srd_swsum, srd_acoef, srd_qhat, srd_r; ///< task 121: tables (FP64 copies), neighbourhood means (S x q), reconstructed values (E x q)
+	Kernel srd_kernel_means, srd_kernel_recon, srd_kernel_apply; ///< task 121: the three stages
+	uint srd_seeds = 0u, srd_entries = 0u, srd_active = 0u; ///< task 121: table sizes
+	bool srd_enabled = false; ///< task 121: the tables are attached
+	Memory<fpxx> srd_pre_fi, vw_pre_wall_fi; bool srd_capture = false; ///< task 124 (diagnostic only): a copy of the stored level-(t+1) state taken immediately before the three SRD stages
+#endif // VOLUMETRIC_WALL_SRD
+#ifdef VOLUMETRIC_WALL_OPEN_X
+	bool vw_open_declared = false; ///< task 105: set_volumetric_wall_open_x was called (required before the attachment)
+	fluidx3d::experimental::VolumetricWallOpenX vw_open{}; ///< task 105: the declared boundary (immutable after the attachment)
+	std::vector<std::uint8_t> vw_open_exterior_row; ///< task 105: exterior row flags of the attached container (host; the affine setup zeroes their scatter)
+	uint vw_ecount = 0u; ///< task 105: number of E cells
+	std::array<uint, 3> vw_open_e_paths{}; ///< task 105: E cells whose feq3 comes from vw_collide (R), vw_support_rr27 (support), stream_collide (ordinary)
+	Memory<double> vw_estate, vw_estate_next; ///< task 105: the E state (rho, ux, uy, uz) per slot (2 Ny Nz slots), current and next level; allocated in allocate() (stream_collide reads vw_estate)
+	Memory<ulong> vw_elattice, vw_einward; ///< task 105: lattice cell of every E cell; lattice cells b-1, b-2 of every E cell
+	Memory<uint> vw_eslot; ///< task 105: slot of every E cell
+	Memory<int> vw_eside, vw_eslot_r, vw_eslot_s, vw_efacet; ///< task 105: outward sign per E cell; slot of every R cell and support cell (-1 interior); R index of the E cell of every facet (-1 interior facet)
+	Memory<uint> vw_open_fail; ///< task 105: E states that failed a 7.6 refusal (count; any count invalidates the run)
+	Kernel vw_kernel_open_state; ///< task 105: the LODI update of the E state (level-n fields -> next state)
+	Kernel vw_kernel_open_store; ///< task 105: the stored E populations, fl32_RTE(feq3(E) - w) in the load set of every E cell at a level
+	std::unique_ptr<fluidx3d::experimental::VolumetricWallOpenLayout> vw_open_layout; ///< task 105: the classification of the attached container (set before set_volumetric_wall)
+	void set_volumetric_wall_open_buffers(const fluidx3d::experimental::VolumetricWallNativeInput& input, const fluidx3d::experimental::VolumetricWallEmbedding& embedding); ///< task 105: E tables, initial E state, the LODI kernel (end of set_volumetric_wall)
+#endif // VOLUMETRIC_WALL_OPEN_X
 	void set_volumetric_wall_affine(const fluidx3d::experimental::VolumetricWallNativeInput& input, const fluidx3d::experimental::VolumetricWallEmbedding& embedding); // after the common buffers exist
 #endif // VOLUMETRIC_WALL
 	Kernel kernel_initialize; // initialization kernel
@@ -239,8 +312,40 @@ public:
 	void enqueue_volumetric_wall_initial_state(); // the declared level-0 pre-collision state of every fluid cell into its t = 0 load addresses (after initialize): R cells from f0, ordinary cells from the native equilibrium
 	fluidx3d::experimental::VolumetricWallNativeCapture read_volumetric_wall_buffers(); // blocking reads of every R buffer, both pendings, the clamp count
 #ifdef VOLUMETRIC_WALL_RR27
+#ifdef VOLUMETRIC_WALL_T119
+	void volumetric_wall_t119_counts(uint& negative_q, uint& p1_failures); // task 119: the two PR2-trigger counts since the attachment (blocking)
+#endif // VOLUMETRIC_WALL_T119
+#ifdef VOLUMETRIC_WALL_SRD
+	void set_volumetric_wall_srd(const fluidx3d::experimental::VolumetricWallNativeInput& input, const fluidx3d::experimental::VolumetricWallEmbedding& embedding); // task 121: tables and kernels (called by set_volumetric_wall)
+	void enqueue_volumetric_wall_srd(const ulong t1); // task 121: the three stages on the complete level-t1 load sets (also used alone by the operator check)
+	void volumetric_wall_srd_read(vector<double>& qhat, vector<double>& recon, vector<uint>& stats); // task 121: neighbourhood means, reconstructed values and the six counters (blocking)
+	void set_volumetric_wall_srd_capture(const bool on) { srd_capture = on; } // task 124: diagnostic capture of the pre-SRD stored state (call before the attachment); changes no kernel, no buffer the run reads
+	void volumetric_wall_srd_pre_fi(vector<fpxx>& host); // task 124: the captured pre-SRD stored state of the last update (blocking)
+	void volumetric_wall_pre_wall_fi(vector<fpxx>& host); // task 125 (diagnostic only, open builds with the capture on): the stored state after the wall stream and BEFORE the E store of the last update (blocking)
+#endif // VOLUMETRIC_WALL_SRD
 	void volumetric_wall_failure_counts(uint& wall_state_failures, uint& clamps); // #2034: the invalid-wall-state and clamp counters since the attachment (blocking, two values)
 #endif // VOLUMETRIC_WALL_RR27
+#ifdef VOLUMETRIC_WALL_SGS
+	/// @brief Store the SGS closure constant for the attachment (V2). The caller (LBM::set_volumetric_wall_sgs) checks it.
+	/// @param k the closure constant k = 18 sqrt(2) (C Delta)^2, finite and >= 0
+	void set_volumetric_wall_sgs_k(const double k) { vw_sgs_k = k; }
+	double volumetric_wall_sgs_k() const { return vw_sgs_k; } ///< the stored closure constant
+#endif // VOLUMETRIC_WALL_SGS
+#ifdef VOLUMETRIC_WALL_OPEN_X
+	/// @brief Store the open-x declaration for the attachment (task 105). The caller (LBM::set_volumetric_wall_open_x) checks it.
+	void set_volumetric_wall_open_x(const fluidx3d::experimental::VolumetricWallOpenX& open) { vw_open = open; vw_open_declared = true; }
+	bool volumetric_wall_open_declared() const { return vw_open_declared; } ///< true after the declaration
+	fluidx3d::experimental::VolumetricWallOpenX volumetric_wall_open_declaration() const { return vw_open; } ///< the stored declaration
+	std::array<uint, 3> volumetric_wall_open_e_paths() const { return vw_open_e_paths; } ///< E cells in R, support, ordinary
+	/// @brief The layout of the attachment (task 105). @throws std::logic_error before the attachment
+	const fluidx3d::experimental::VolumetricWallOpenLayout& volumetric_wall_open_layout() const { if(!vw_open_layout) throw std::logic_error("open x: no attachment"); return *vw_open_layout; }
+	/// @brief Keep the classification of the container for the attachment (task 105; LBM::attach_volumetric_wall).
+	void set_volumetric_wall_open_layout(const fluidx3d::experimental::VolumetricWallOpenLayout& layout) { vw_open_layout = std::make_unique<fluidx3d::experimental::VolumetricWallOpenLayout>(layout); }
+	/// @brief The E state (rho, ux, uy, uz per slot, 2 Ny Nz slots; solid slots 0) of the current level (blocking).
+	void vw_read_open_state(vector<double>& host);
+	/// @brief The count of E states that failed a 7.6 refusal since the attachment (blocking).
+	uint volumetric_wall_open_failures();
+#endif // VOLUMETRIC_WALL_OPEN_X
 	void vw_read_fi(vector<fpxx>& host); // raw stored populations (the parity t gives their meaning)
 	void vw_write_fi(const vector<fpxx>& host);
 	void vw_read_pending(vector<double>& host); // the current pending inventory
@@ -677,10 +782,48 @@ public:
 	/// finite values, not against the geometry
 	/// @note Fails closed (print_error) on the same errors as set_volumetric_wall and on a wrong or non-finite rows file.
 	void set_volumetric_wall_research(const string& vwnat_path, const string& rows_path);
+#ifdef VOLUMETRIC_WALL_SGS
+	/// @brief V2: the constant of the static Smagorinsky closure in the RR collision of every cell (VOLUMETRIC_WALL_SGS).
+	/// The per-cell rate is wl = 1/(tau0/2 + sqrt(tau0^2 + k sqrt(A:A)/rho)/2), tau0 = 1/omega, with the full force-aware
+	/// second moment A of the collision and Delta = 1. Without a call, k = 0: the rate omega exactly (the V1 collision).
+	/// @param k the closure constant k = 18 sqrt(2) (C Delta)^2 (not C). The qualified value is (double)0.76421222f.
+	/// @note Fails closed (print_error): k not finite or negative, a call after run(), a call after the attachment
+	/// (set_volumetric_wall gives k to the kernels).
+	void set_volumetric_wall_sgs(const double k);
+	double get_volumetric_wall_sgs() const { return lbm_domain[0]->volumetric_wall_sgs_k(); } ///< the stored SGS constant k (0 without a call)
+#endif // VOLUMETRIC_WALL_SGS
+	/// @brief Task 105: declare the open-x boundary (VOLUMETRIC_WALL_OPEN_X) before set_volumetric_wall(). The attachment
+	/// classifies the container (E cells, exterior facets, x-wrap refusals), sets the initial E state and gives the
+	/// declaration to the kernels; it is immutable afterwards. An open build refuses the attachment without it, run() with a
+	/// nonzero force (contract A5). The open boundary is a compile-time option: a build without VOLUMETRIC_WALL_OPEN_X
+	/// refuses this call (print_error), so the closed builds keep their code and behaviour.
+	/// @param open the declaration (validated here; the initial E state is checked against the refusals 7.6 at the attachment)
+	/// @note Fails closed (print_error): no VOLUMETRIC_WALL_OPEN_X, an invalid declaration, a second call, a call after the
+	/// attachment or after run().
+	void set_volumetric_wall_open_x(const fluidx3d::experimental::VolumetricWallOpenX& open);
+#ifdef VOLUMETRIC_WALL_OPEN_X
+	/// @brief The current E state, 4 doubles (rho, ux, uy, uz) per slot side*(Ny Nz) + y + Ny z (blocking read).
+	void volumetric_wall_read_open_state(vector<double>& host) { lbm_domain[0]->vw_read_open_state(host); }
+	/// @brief E states that failed a refusal 7.6 since the attachment (blocking; any count invalidates the run).
+	uint volumetric_wall_open_failures() { return lbm_domain[0]->volumetric_wall_open_failures(); }
+	/// @brief The declaration as stored and given to the kernels (the kernel arguments are copies of these values).
+	fluidx3d::experimental::VolumetricWallOpenX volumetric_wall_open_declaration() const { return lbm_domain[0]->volumetric_wall_open_declaration(); }
+	/// @brief How many E cells take their feq3 from vw_collide (R cells), vw_support_rr27 (support cells) and stream_collide (ordinary cells).
+	std::array<uint, 3> volumetric_wall_open_e_paths() const { return lbm_domain[0]->volumetric_wall_open_e_paths(); }
+	/// @brief The classification the attachment used (E cells in mesh order, their slots and sides, exterior facets and rows).
+	const fluidx3d::experimental::VolumetricWallOpenLayout& volumetric_wall_open_layout() const { return lbm_domain[0]->volumetric_wall_open_layout(); }
+#endif // VOLUMETRIC_WALL_OPEN_X
 	bool volumetric_wall_enabled() const { return lbm_domain[0]->volumetric_wall_enabled(); }
 	fluidx3d::experimental::VolumetricWallNativeCapture volumetric_wall_capture() { return lbm_domain[0]->read_volumetric_wall_buffers(); }
 	void volumetric_wall_read_fi(vector<fpxx>& host) { lbm_domain[0]->vw_read_fi(host); }
 	void volumetric_wall_write_fi(const vector<fpxx>& host) { lbm_domain[0]->vw_write_fi(host); }
+#ifdef VOLUMETRIC_WALL_SRD
+	void volumetric_wall_srd_apply(const ulong t1) { lbm_domain[0]->enqueue_volumetric_wall_srd(t1); lbm_domain[0]->finish_queue(); } // task 121: the redistribution alone on the stored level-t1 load sets (operator check)
+	void volumetric_wall_srd_read(vector<double>& qhat, vector<double>& recon, vector<uint>& stats) { lbm_domain[0]->volumetric_wall_srd_read(qhat, recon, stats); }
+	void set_volumetric_wall_srd_capture(const bool on) { lbm_domain[0]->set_volumetric_wall_srd_capture(on); }
+	void volumetric_wall_srd_pre_fi(vector<fpxx>& host) { lbm_domain[0]->volumetric_wall_srd_pre_fi(host); }
+	void volumetric_wall_pre_wall_fi(vector<fpxx>& host) { lbm_domain[0]->volumetric_wall_pre_wall_fi(host); }
+#endif // VOLUMETRIC_WALL_SRD
 	void volumetric_wall_read_pending(vector<double>& host) { lbm_domain[0]->vw_read_pending(host); }
 	void volumetric_wall_write_pending(const vector<double>& host) { lbm_domain[0]->vw_write_pending(host); }
 	void volumetric_wall_set_time_step(const ulong t) { for(uint d=0u; d<get_D(); d++) lbm_domain[d]->set_time_step(t); } // restart: the parity of the restored fi
@@ -900,3 +1043,6 @@ public:
 	Graphics graphics;
 #endif // GRAPHICS
 }; // LBM
+#ifdef VOLUMETRIC_WALL_OPEN_X
+std::string vw_open_refusal(const double rho_b, const double ux, const double uy, const double uz, const int s); // task 125: the host admission predicate of one E state (empty text = admissible); declared for the control fixture
+#endif // VOLUMETRIC_WALL_OPEN_X

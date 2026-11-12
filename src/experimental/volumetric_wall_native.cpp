@@ -239,7 +239,68 @@ VolumetricWallNativeInput VolumetricWallNativeInput::read(const std::string& pat
             }
         }
     }
+    if(sections.count("facet_friction")) {   // V2: optional per-facet rough law (K0_a, C_a); checked in validate()
+        in.facet_friction = take<double>(sections, "facet_friction", dtype_f64);
+        if(in.facet_friction.empty()) {
+            throw std::runtime_error("VolumetricWallNative: empty section facet_friction");
+        }
+    }
+    if(sections.count("facet_kind")) {   // V2: optional facet metadata (0 terrain, 1 lid); checked in validate()
+        in.facet_kind = take<std::uint32_t>(sections, "facet_kind", dtype_u32);
+        if(in.facet_kind.empty()) {
+            throw std::runtime_error("VolumetricWallNative: empty section facet_kind");
+        }
+    }
+    {   // task 119: the two OPTIONAL companion sections of the whole-prism correction, both or none
+        const bool has_delta{ sections.count("t119_gdelta")>0u }, has_moment{ sections.count("t119_wmoment")>0u };
+        if(has_delta!=has_moment) {
+            throw std::runtime_error("VolumetricWallNative: the task-119 sections are incomplete (t119_gdelta and t119_wmoment, both or none)");
+        }
+        if(has_delta) {
+            in.t119_gdelta = take<double>(sections, "t119_gdelta", dtype_f64);
+            in.t119_wmoment = take<double>(sections, "t119_wmoment", dtype_f64);
+            if(in.t119_gdelta.empty()) {   // task 122: t119_wmoment may be empty exactly when W has no entries (validate() requires 3 values per W entry); t119_gdelta is then an inert placeholder under the W = 0 guard
+                throw std::runtime_error("VolumetricWallNative: empty task-119 section t119_gdelta");
+            }
+        }
+    }
     const std::vector<char> text{ take<char>(sections, "provenance", dtype_text) };
+    {   // task 121: the 18 OPTIONAL sections of the task-120 state redistribution, all or none
+        const std::array<const char*, 18> names{ "t121_seeds", "t121_entry_starts", "t121_entry_cell", "t121_entry_w", "t121_entry_wv", "t121_entry_delta", "t121_vhat",
+            "t121_st_starts", "t121_st_cell", "t121_st_w", "t121_st_d", "t121_st_seed_index", "t121_B", "t121_st_wsum", "t121_active_cells", "t121_active_coef",
+            "t121_active_starts", "t121_active_entry" };
+        std::uint32_t present{ 0u };
+        for(const char* name : names) {
+            present += sections.count(name) ? 1u : 0u;
+        }
+        if(present!=0u && present!=18u) {
+            throw std::runtime_error("VolumetricWallNative: the task-121 sections are incomplete (all 18 or none), found "+std::to_string(present));
+        }
+        if(present==18u) {
+            SrdTables& t{ in.srd };
+            t.seeds = take<std::uint32_t>(sections, "t121_seeds", dtype_u32);
+            t.entry_starts = take<std::uint32_t>(sections, "t121_entry_starts", dtype_u32);
+            t.entry_cell = take<std::uint32_t>(sections, "t121_entry_cell", dtype_u32);
+            t.entry_w = take<double>(sections, "t121_entry_w", dtype_f64);
+            t.entry_wv = take<double>(sections, "t121_entry_wv", dtype_f64);
+            t.entry_delta = take<double>(sections, "t121_entry_delta", dtype_f64);
+            t.vhat = take<double>(sections, "t121_vhat", dtype_f64);
+            t.st_starts = take<std::uint32_t>(sections, "t121_st_starts", dtype_u32);
+            t.st_cell = take<std::uint32_t>(sections, "t121_st_cell", dtype_u32);
+            t.st_w = take<double>(sections, "t121_st_w", dtype_f64);
+            t.st_d = take<double>(sections, "t121_st_d", dtype_f64);
+            t.st_seed_index = take<std::int32_t>(sections, "t121_st_seed_index", dtype_i32);
+            t.B = take<double>(sections, "t121_B", dtype_f64);
+            t.st_wsum = take<double>(sections, "t121_st_wsum", dtype_f64);
+            t.active_cells = take<std::uint32_t>(sections, "t121_active_cells", dtype_u32);
+            t.active_coef = take<double>(sections, "t121_active_coef", dtype_f64);
+            t.active_starts = take<std::uint32_t>(sections, "t121_active_starts", dtype_u32);
+            t.active_entry = take<std::uint32_t>(sections, "t121_active_entry", dtype_u32);
+            if(t.seeds.empty()) {
+                throw std::runtime_error("VolumetricWallNative: empty task-121 section t121_seeds");
+            }
+        }
+    }
     in.provenance.assign(text.begin(), text.end());
     if(!sections.empty()) {
         throw std::runtime_error("VolumetricWallNative: unknown section "+sections.begin()->first);
@@ -253,7 +314,7 @@ void VolumetricWallNativeInput::write(const std::string& path) const {
         throw std::runtime_error("VolumetricWallNative: cannot write "+path);
     }
     out.write(magic, 8);
-    const std::uint32_t count{ (friction_rows.empty() ? 37u : 38u)+(affine() ? 6u : 0u) };   // 38 with the optional friction_rows (task 43); box, counts, cell_xyz, volume, centroid, sample_point, mode_phi, normal, area, facet_offsets, row_direction, prism_volume, row_origin (13) + 5 maps x 4 + scalars, f0, s0, provenance (4); 6 more with the affine sections (task 55)
+    const std::uint32_t count{ (friction_rows.empty() ? 37u : 38u)+(affine() ? 6u : 0u)+(facet_friction.empty() ? 0u : 1u)+(facet_kind.empty() ? 0u : 1u)+(t119() ? 2u : 0u)+(has_srd() ? 18u : 0u) };   // 38 with the optional friction_rows (task 43); box, counts, cell_xyz, volume, centroid, sample_point, mode_phi, normal, area, facet_offsets, row_direction, prism_volume, row_origin (13) + 5 maps x 4 + scalars, f0, s0, provenance (4); 6 more with the affine sections (task 55); +1 each for the V2 facet_friction and facet_kind
     out.write(reinterpret_cast<const char*>(&count), 4);
     const std::vector<std::int32_t> box{ this->box[0], this->box[1], this->box[2] };
     write_vector(out, "box", dtype_i32, box);
@@ -290,9 +351,139 @@ void VolumetricWallNativeInput::write(const std::string& path) const {
         write_vector(out, "gradient_indices", dtype_u32, gradient_indices);
         write_vector(out, "gradient_weights", dtype_f64, gradient_weights);
     }
+    if(!facet_friction.empty()) {   // V2: written only when present, so an old container keeps its bytes
+        write_vector(out, "facet_friction", dtype_f64, facet_friction);
+    }
+    if(!facet_kind.empty()) {
+        write_vector(out, "facet_kind", dtype_u32, facet_kind);
+    }
+    if(t119()) {   // task 119: written only when present
+        write_vector(out, "t119_gdelta", dtype_f64, t119_gdelta);
+        write_vector(out, "t119_wmoment", dtype_f64, t119_wmoment);
+    }
+    if(has_srd()) {   // task 121: written only when present
+        write_vector(out, "t121_seeds", dtype_u32, srd.seeds);
+        write_vector(out, "t121_entry_starts", dtype_u32, srd.entry_starts);
+        write_vector(out, "t121_entry_cell", dtype_u32, srd.entry_cell);
+        write_vector(out, "t121_entry_w", dtype_f64, srd.entry_w);
+        write_vector(out, "t121_entry_wv", dtype_f64, srd.entry_wv);
+        write_vector(out, "t121_entry_delta", dtype_f64, srd.entry_delta);
+        write_vector(out, "t121_vhat", dtype_f64, srd.vhat);
+        write_vector(out, "t121_st_starts", dtype_u32, srd.st_starts);
+        write_vector(out, "t121_st_cell", dtype_u32, srd.st_cell);
+        write_vector(out, "t121_st_w", dtype_f64, srd.st_w);
+        write_vector(out, "t121_st_d", dtype_f64, srd.st_d);
+        write_vector(out, "t121_st_seed_index", dtype_i32, srd.st_seed_index);
+        write_vector(out, "t121_B", dtype_f64, srd.B);
+        write_vector(out, "t121_st_wsum", dtype_f64, srd.st_wsum);
+        write_vector(out, "t121_active_cells", dtype_u32, srd.active_cells);
+        write_vector(out, "t121_active_coef", dtype_f64, srd.active_coef);
+        write_vector(out, "t121_active_starts", dtype_u32, srd.active_starts);
+        write_vector(out, "t121_active_entry", dtype_u32, srd.active_entry);
+    }
     write_section(out, "provenance", dtype_text, provenance.data(), provenance.size(), 1u);
     if(!out) {
         throw std::runtime_error("VolumetricWallNative: write failed "+path);
+    }
+}
+
+namespace {
+/// @brief Task 121: a CSR offset list must have the given length, start at 0, never decrease and end at the entry count.
+void require_offsets(const std::vector<std::uint32_t>& offsets, const size_t rows, const size_t entries, const std::string& name) {
+    require(offsets.size()==rows+1u && offsets.front()==0u && offsets.back()==entries, "t121: offsets "+name+" size, start or end");
+    for(size_t i=0u; i<rows; i++) {
+        require(offsets[i]<=offsets[i+1u], "t121: offsets "+name+" decrease at "+std::to_string(i));
+    }
+}
+/// @brief Task 121: a 3x3 row-major matrix is symmetric within a rounding tolerance (the CPU builds B by a sum whose off-diagonal pairs differ at rounding level; the solve reads the full matrix) and has a positive Cholesky pivot sequence.
+/// @param b the matrix, row-major
+/// @param tolerance absolute bound of |b_ij - b_ji| (an operation-count bound of the construction)
+bool symmetric_positive_definite(const double* b, const double tolerance) {
+    if(std::fabs(b[1]-b[3])>tolerance || std::fabs(b[2]-b[6])>tolerance || std::fabs(b[5]-b[7])>tolerance) {
+        return false;
+    }
+    const double l00{ b[0] };
+    if(!(l00>0.0)) {
+        return false;
+    }
+    const double l10{ b[3]/std::sqrt(l00) };
+    const double d1{ b[4]-l10*l10 };
+    if(!(d1>0.0)) {
+        return false;
+    }
+    const double l20{ b[6]/std::sqrt(l00) };
+    const double l21{ (b[7]-l20*l10)/std::sqrt(d1) };
+    const double d2{ b[8]-l20*l20-l21*l21 };
+    return d2>0.0;
+}
+}   // namespace
+
+void VolumetricWallNativeInput::SrdTables::validate(const std::uint32_t cells) const {
+    const size_t S{ seeds.size() }, E{ entry_cell.size() }, T{ st_cell.size() }, A{ active_cells.size() };
+    require(S>0u && E>=S && T>0u && A>0u, "t121: empty or inconsistent table sizes");
+    require(entry_w.size()==E && entry_wv.size()==E && entry_delta.size()==3u*E, "t121: entry array sizes");
+    require(vhat.size()==S && B.size()==9u*S && st_wsum.size()==S, "t121: per-seed array sizes");
+    require(st_w.size()==T && st_d.size()==3u*T && st_seed_index.size()==T, "t121: stencil array sizes");
+    require(active_coef.size()==A && active_entry.size()==E, "t121: active array sizes");
+    require_offsets(entry_starts, S, E, "entry_starts");
+    require_offsets(st_starts, S, T, "st_starts");
+    require_offsets(active_starts, A, E, "active_starts");
+    for(size_t s=0u; s<S; s++) {
+        require(seeds[s]<cells && (s==0u || seeds[s-1u]<seeds[s]), "t121: seeds not ascending cells at "+std::to_string(s));
+        require(entry_starts[s]<entry_starts[s+1u] && st_starts[s]<st_starts[s+1u], "t121: a seed without entries or stencil, seed "+std::to_string(s));
+        require(std::isfinite(vhat[s]) && vhat[s]>0.0 && std::isfinite(st_wsum[s]) && st_wsum[s]>0.0, "t121: vhat or st_wsum not finite and positive, seed "+std::to_string(s));
+        double stencil_sum{ 0.0 };
+        std::array<double, 9> pair_abs{};
+        for(size_t t=st_starts[s]; t<st_starts[s+1u]; t++) {
+            stencil_sum += st_w[t];
+            for(size_t a=0u; a<3u; a++) {
+                for(size_t b2=0u; b2<3u; b2++) {
+                    pair_abs[3u*a+b2] += st_w[t]*std::fabs(st_d[3u*t+a])*std::fabs(st_d[3u*t+b2]);
+                }
+            }
+        }
+        const double eps{ 1.1102230246251565e-16 };   // 2^-53
+        const double count{ static_cast<double>(st_starts[s+1u]-st_starts[s]) };
+        double largest{ 0.0 };
+        for(const double v : pair_abs) {
+            largest = std::max(largest, v/st_wsum[s]);
+        }
+        const double symmetry_tolerance{ (2.0*count+4.0)*eps*largest };   // operation-count bound of the accumulation of B
+        require(symmetric_positive_definite(&B[9u*s], symmetry_tolerance), "t121: B is not symmetric (within the operation-count tolerance) and positive definite, seed "+std::to_string(s));
+        require(std::fabs(stencil_sum-st_wsum[s])<=(count+2.0)*eps*stencil_sum, "t121: st_wsum differs from the sum of st_w beyond the operation-count bound, seed "+std::to_string(s));
+        double group_sum{ 0.0 };
+        for(size_t e=entry_starts[s]; e<entry_starts[s+1u]; e++) {
+            group_sum += entry_wv[e];
+        }
+        require(std::fabs(group_sum-vhat[s])<=1e-12*vhat[s], "t121: vhat differs from the sum of w V over the group, seed "+std::to_string(s));
+    }
+    for(size_t e=0u; e<E; e++) {
+        require(entry_cell[e]<cells && std::isfinite(entry_w[e]) && entry_w[e]>=0.0 && std::isfinite(entry_wv[e]) && entry_wv[e]>=0.0, "t121: entry cell, w or wv, entry "+std::to_string(e));
+    }
+    for(const double v : entry_delta) {
+        require(std::isfinite(v), "t121: entry delta not finite");
+    }
+    for(size_t t=0u; t<T; t++) {
+        require(st_cell[t]<cells && std::isfinite(st_w[t]) && st_w[t]>0.0, "t121: stencil cell or weight, entry "+std::to_string(t));
+        const std::int32_t idx{ st_seed_index[t] };
+        require(idx>=-1 && idx<static_cast<std::int32_t>(S), "t121: st_seed_index out of range, entry "+std::to_string(t));
+        const bool is_seed{ std::binary_search(seeds.begin(), seeds.end(), st_cell[t]) };
+        require((idx>=0)==is_seed, "t121: st_seed_index differs from the seed membership of the cell, entry "+std::to_string(t));
+        require(idx<0 || seeds[static_cast<size_t>(idx)]==st_cell[t], "t121: st_seed_index points at another cell, entry "+std::to_string(t));
+        for(size_t a=0u; a<3u; a++) {
+            require(std::isfinite(st_d[3u*t+a]), "t121: stencil offset not finite, entry "+std::to_string(t));
+        }
+    }
+    std::vector<std::uint8_t> used(E, 0u);
+    for(size_t a=0u; a<A; a++) {
+        require(active_cells[a]<cells && (a==0u || active_cells[a-1u]<active_cells[a]), "t121: active cells not ascending, index "+std::to_string(a));
+        require(std::isfinite(active_coef[a]) && active_coef[a]>=0.0 && active_coef[a]<=1.0, "t121: active coefficient not in [0, 1], index "+std::to_string(a));
+        require(active_starts[a]<active_starts[a+1u], "t121: an active cell without entries, index "+std::to_string(a));
+        for(size_t z=active_starts[a]; z<active_starts[a+1u]; z++) {
+            const std::uint32_t e{ active_entry[z] };
+            require(e<E && used[e]==0u && entry_cell[e]==active_cells[a], "t121: active_entry is not a permutation matching the cell, position "+std::to_string(z));
+            used[e] = 1u;
+        }
     }
 }
 
@@ -357,6 +548,53 @@ void VolumetricWallNativeInput::validate() const {
         require(friction_rows.size()==static_cast<size_t>(rows)*3u, "friction_rows size is not rows*3");
         for(const double v : friction_rows) {
             require(std::isfinite(v), "friction_rows value not finite");
+        }
+    }
+    if(!facet_friction.empty()) {   // V2: the per-facet rough law (K0_a, C_a)
+        require(facet_friction.size()==static_cast<size_t>(facets)*2u, "facet_friction size is not facets*2");
+        for(const double v : facet_friction) {
+            require(std::isfinite(v) && v>=0.0, "facet_friction value negative or not finite");
+        }
+    }
+    if(!facet_kind.empty()) {   // V2: 0 terrain, 1 lid
+        require(facet_kind.size()==static_cast<size_t>(facets), "facet_kind size is not facets");
+        for(const std::uint32_t v : facet_kind) {
+            require(v<=1u, "facet_kind value is not 0 (terrain) or 1 (lid)");
+        }
+    }
+    if(has_srd()) {   // task 121: structure of the redistribution tables
+        srd.validate(cells);
+    }
+    if(t119()) {   // task 119: sizes, finiteness, the reach bound and the per-row first-moment and coverage identities (host-side, before any upload)
+        require(t119_gdelta.size()==3u*G.weights.size(), "t119_gdelta size is not 3 per G entry");
+        require(t119_wmoment.size()==3u*W.weights.size(), "t119_wmoment size is not 3 per W entry");
+        for(const double v : t119_gdelta) {
+            require(std::isfinite(v) && std::fabs(v)<=1.5+1e-9, "t119_gdelta value not finite or beyond the reach 1.5");
+        }
+        for(const double v : t119_wmoment) {
+            require(std::isfinite(v), "t119_wmoment value not finite");
+        }
+        std::vector<double> sum_m(3u*static_cast<size_t>(rows), 0.0), w_col(rows, 0.0), moment(3u*static_cast<size_t>(rows), 0.0), h_row(rows, 0.0);
+        for(std::uint32_t r=0u; r<W.rows; r++) {
+            for(std::uint32_t z=W.offsets[r]; z<W.offsets[r+1u]; z++) {
+                const std::uint32_t p{ W.indices[z] };
+                w_col[p] += W.weights[z];
+                for(std::uint32_t k=0u; k<3u; k++) { sum_m[3u*p+k] += t119_wmoment[3u*z+k]; }
+            }
+        }
+        for(std::uint32_t r=0u; r<G.rows; r++) {
+            for(std::uint32_t z=G.offsets[r]; z<G.offsets[r+1u]; z++) {
+                h_row[r] += G.weights[z];
+                for(std::uint32_t k=0u; k<3u; k++) { moment[3u*r+k] += G.weights[z]*t119_gdelta[3u*z+k]; }
+            }
+        }
+        for(std::uint32_t r=0u; r<rows; r++) {
+            const double v{ prism_volume[r] };
+            require(w_col[r]==0.0 || h_row[r]>0.0, "t119: a row with a W column has no fluid gather part (H = 0): the correction is undefined there, row "+std::to_string(r));
+            require(std::fabs(h_row[r]+w_col[r]-v)<=1e-9*v, "t119: H + W differs from the prism volume, row "+std::to_string(r));
+            for(std::uint32_t k=0u; k<3u; k++) {
+                require(std::fabs(moment[3u*r+k]+sum_m[3u*r+k])<=1e-9*v, "t119: first-moment partition identity violated, row "+std::to_string(r));
+            }
         }
     }
     require(centroid.size()==static_cast<size_t>(cells)*3u && sample_point.size()==static_cast<size_t>(facets)*3u, "centroid/sample_point sizes");
@@ -785,8 +1023,13 @@ std::string NativeOwnershipReport::text() const {
 // ---------------------------------------------------------------- VolumetricWallEmbedding
 
 VolumetricWallEmbedding::VolumetricWallEmbedding(const VolumetricWallNativeInput& input, const std::vector<std::uint8_t>& solid)
-    : in_(input), solid_(solid), directions_(input.velocity_set), addresses_(input.box, directions_) {
+    : VolumetricWallEmbedding(input, solid, std::vector<std::uint32_t>{}) {
+}
+
+VolumetricWallEmbedding::VolumetricWallEmbedding(const VolumetricWallNativeInput& input, const std::vector<std::uint8_t>& solid, const std::vector<std::uint32_t>& forced_r)
+    : in_(input), solid_(solid), forced_r_(forced_r), directions_(input.velocity_set), addresses_(input.box, directions_) {
     in_.validate();
+    for(const std::uint32_t c : forced_r_) require(c<in_.cells, "a forced R cell is outside the mesh");
     require(solid_.size()==addresses_.cells(), "solid mask size differs from the box");
     lattice_of_cell_.resize(in_.cells);
     for(std::uint32_t c=0u; c<in_.cells; c++) {
@@ -874,6 +1117,7 @@ void VolumetricWallEmbedding::derive_regions() {
     s_cells_ = S.size();
     r_set_ = T;
     r_set_.insert(S.begin(), S.end());
+    r_set_.insert(forced_r_.begin(), forced_r_.end());   // task 105: R cells by declaration (empty outside open-x attachments)
     for(;;) {   // closure: donors of non-pure R rows, receivers of non-pure rows fed from R
         std::set<std::uint32_t> grow{};
         for(const std::uint32_t c : r_set_) {
@@ -1030,6 +1274,189 @@ void VolumetricWallEmbedding::write_lists(const std::string& prefix) const {
     dump("R_cells", r_cells_);
     dump("R_rows", r_rows_);
     dump("native_rows", native_rows_);
+}
+
+// ---------------------------------------------------------------- V2 (task 105): the open-x declaration and classification
+
+void VolumetricWallOpenX::validate() const {
+    const std::array<double, 10> scalars{ inlet_velocity[0], inlet_velocity[1], inlet_velocity[2], inlet_relaxation, outlet_sigma,
+                                          outlet_mach, outlet_length, outlet_rho_inf, initial_rho, initial_velocity[0] };
+    for(const double v : scalars) {
+        require(std::isfinite(v), "open x: every declared value must be finite");
+    }
+    require(std::isfinite(initial_velocity[1]) && std::isfinite(initial_velocity[2]), "open x: every declared value must be finite");
+    require(inlet_velocity[0]>0.0, "open x: the inlet target needs u_x > 0 (inflow through x = 0)");
+    require(inlet_velocity[0]<1.0/std::sqrt(3.0), "open x: the inlet target needs u_x < c = 1/sqrt(3) (subsonic inflow, 7.6; a hard inlet would set |u_n| >= c at the first update)");
+    require(hard_inlet || (inlet_relaxation>=0.0 && inlet_relaxation<1.0), "open x: the relaxed inlet needs 0 <= K_u < 1 (explicit update)");
+    require(outlet_sigma>0.0, "open x: outlet sigma must be > 0 (K_p = 0 is refused, contract 7.4)");
+    require(outlet_mach>=0.0 && outlet_mach<1.0, "open x: outlet Ma must be in [0, 1)");
+    require(outlet_length>0.0, "open x: outlet L_x must be > 0");
+    require(outlet_rho_inf>0.0, "open x: outlet rho_inf must be > 0");
+    require(initial_rho>0.0, "open x: the initial E density must be > 0");
+    const double K{ outlet_relaxation() };
+    require(std::isfinite(K) && K>0.0, "open x: the computed K_p is not finite and > 0");
+}
+
+double VolumetricWallOpenX::outlet_relaxation() const {
+    const double c{ 1.0/std::sqrt(3.0) };
+    return outlet_sigma*(1.0-outlet_mach*outlet_mach)*c/outlet_length;
+}
+
+VolumetricWallOpenLayout::VolumetricWallOpenLayout(const VolumetricWallNativeInput& in) {
+    const std::uint32_t q{ in.velocity_set };
+    nx_ = in.box[0];
+    ny_ = in.box[1];
+    nz_ = in.box[2];
+    require(nx_>=6, "open x: the box needs at least 6 cells in x (E column, two inward cells, both sides)");
+    // cells: x index, E membership, the lookup by lattice coordinates
+    std::map<std::array<std::int32_t, 3>, std::uint32_t> cell_at{};
+    std::vector<std::int32_t> cell_x(in.cells);
+    for(std::uint32_t cell=0u; cell<in.cells; cell++) {
+        const std::array<std::int32_t, 3> p{ in.cell_xyz[3u*cell], in.cell_xyz[3u*cell+1u], in.cell_xyz[3u*cell+2u] };
+        require(p[0]>=0 && p[0]<nx_, "open x: a cell lies outside the box in x");
+        require(static_cast<std::int32_t>(std::floor(in.centroid[3u*cell]))==p[0] && static_cast<std::int32_t>(std::floor(in.centroid[3u*cell+1u]))==p[1],
+                "open x: a cell centroid is not inside its x-y column");
+        cell_at[p] = cell;
+        cell_x[cell] = p[0];
+    }
+    slot_of_cell_.assign(in.cells, -1);
+    std::vector<std::uint8_t> is_e(in.cells, 0u);
+    for(std::uint32_t cell=0u; cell<in.cells; cell++) {
+        const std::int32_t x{ cell_x[cell] };
+        if(x!=0 && x!=nx_-1) {
+            continue;
+        }
+        require(in.volume[cell]==1.0, "open x: an E cell is not fully fluid (V != 1): the apron is not flat at an integer face (A2)");
+        const std::int32_t side{ x==0 ? 0 : 1 };
+        const std::int32_t s{ x==0 ? -1 : 1 };
+        const std::int32_t y{ in.cell_xyz[3u*cell+1u] }, z{ in.cell_xyz[3u*cell+2u] };
+        is_e[cell] = 1u;
+        e_cells_.push_back(cell);
+        e_side_.push_back(s);
+        const std::uint32_t slot{ static_cast<std::uint32_t>(side)*static_cast<std::uint32_t>(ny_)*static_cast<std::uint32_t>(nz_)
+                                  +static_cast<std::uint32_t>(y)+static_cast<std::uint32_t>(ny_)*static_cast<std::uint32_t>(z) };
+        e_slot_.push_back(slot);
+        slot_of_cell_[cell] = static_cast<std::int64_t>(slot);
+    }
+    require(!e_cells_.empty(), "open x: no E cell");
+    for(size_t k=0u; k<e_cells_.size(); k++) { // inward neighbours b-1, b-2 at the same y, z (contract 7.3)
+        const std::uint32_t cell{ e_cells_[k] };
+        const std::int32_t step{ -e_side_[k] };
+        for(std::int32_t d=1; d<=2; d++) {
+            const std::array<std::int32_t, 3> p{ cell_x[cell]+step*d, in.cell_xyz[3u*cell+1u], in.cell_xyz[3u*cell+2u] };
+            const auto found{ cell_at.find(p) };
+            require(found!=cell_at.end() && in.volume[found->second]==1.0 && is_e[found->second]==0u,
+                    "open x: an E cell has no full interior cell "+std::to_string(d)+" step(s) inward at the same y, z (apron too narrow)");
+            e_inward_.push_back(found->second);
+        }
+    }
+    // exterior facets: the facet point (sample point - n/2) in an E column; flat; exactly one adjacent E cell
+    std::vector<double> facet_x(in.facets);
+    exterior_facet_.assign(in.facets, 0u);
+    e_cell_of_facet_.assign(in.facets, -1);
+    for(std::uint32_t a=0u; a<in.facets; a++) {
+        const double px{ in.sample_point[3u*a]-0.5*in.normal[3u*a] };
+        const double py{ in.sample_point[3u*a+1u]-0.5*in.normal[3u*a+1u] };
+        facet_x[a] = px;
+        const std::int32_t column{ static_cast<std::int32_t>(std::floor(px)) };
+        if(column!=0 && column!=nx_-1) {
+            continue;
+        }
+        require(in.normal[3u*a]==0.0 && in.normal[3u*a+1u]==0.0 && std::fabs(in.normal[3u*a+2u])==1.0,
+                "open x: an E-column facet is not a flat face (normal != +-z): the apron is not flat (A2)");
+        exterior_facet_[a] = 1u;
+        const std::int32_t cy{ static_cast<std::int32_t>(std::floor(py)) };
+        std::int64_t match{ -1 };
+        std::uint32_t count{ 0u };
+        for(const std::uint32_t cell : e_cells_) {
+            if(cell_x[cell]==column && in.cell_xyz[3u*cell+1u]==cy && in.centroid[3u*cell+2u]==in.sample_point[3u*a+2u]) {
+                match = static_cast<std::int64_t>(cell);
+                count++;
+            }
+        }
+        require(count==1u, "open x: exterior facet "+std::to_string(a)+" has not exactly one adjacent E cell");
+        e_cell_of_facet_[a] = match;
+    }
+    std::vector<std::uint32_t> facet_of_row(in.rows);
+    for(std::uint32_t a=0u; a<in.facets; a++) {
+        for(std::uint32_t r=in.facet_offsets[a]; r<in.facet_offsets[a+1u]; r++) facet_of_row[r] = a;
+    }
+    exterior_row_.assign(in.rows, 0u);
+    for(std::uint32_t r=0u; r<in.rows; r++) exterior_row_[r] = exterior_facet_[facet_of_row[r]];
+    // the x wrap (contract O8): an entry is across the wrap when its two x positions are more than Nx/2 apart
+    const double half{ 0.5*static_cast<double>(nx_) };
+    const auto wrapped = [&](const double x0, const double x1) { return std::fabs(x0-x1)>half; };
+    const auto column_of = [&](const std::uint32_t a) { return std::floor(facet_x[a]); };
+    for(std::uint32_t state=0u; state<in.states(); state++) { // D: receiver state x donor state
+        const std::uint32_t receiver{ state/q };
+        for(std::uint32_t z=in.D.offsets[state]; z<in.D.offsets[state+1u]; z++) {
+            const std::uint32_t donor{ in.D.indices[z]/q };
+            if(!wrapped(cell_x[receiver], cell_x[donor])) continue;
+            require(is_e[receiver]!=0u && is_e[donor]!=0u, "open x: a D entry across the x wrap touches an interior cell");
+            wrap_d_++;
+        }
+    }
+    for(std::uint32_t r=0u; r<in.rows; r++) { // G: row x donor state
+        for(std::uint32_t z=in.G.offsets[r]; z<in.G.offsets[r+1u]; z++) {
+            const std::uint32_t donor{ in.G.indices[z]/q };
+            if(!wrapped(column_of(facet_of_row[r]), cell_x[donor])) continue;
+            require(exterior_row_[r]!=0u, "open x: a gather of an interior facet row is across the x wrap");
+            require(is_e[donor]!=0u, "open x: a gather across the x wrap has an interior donor");
+            wrap_g_++;
+        }
+    }
+    for(std::uint32_t state=0u; state<in.states(); state++) { // R: receiver state x row
+        const std::uint32_t receiver{ state/q };
+        for(std::uint32_t z=in.R.offsets[state]; z<in.R.offsets[state+1u]; z++) {
+            const std::uint32_t r{ in.R.indices[z] };
+            if(!wrapped(column_of(facet_of_row[r]), cell_x[receiver])) continue;
+            require(exterior_row_[r]!=0u, "open x: a return of an interior facet row is across the x wrap");
+            require(is_e[receiver]!=0u, "open x: a return across the x wrap lands in an interior cell");
+            wrap_r_++;
+        }
+    }
+    for(std::uint32_t a=0u; a<in.facets; a++) { // S: facet x cell
+        for(std::uint32_t z=in.S.offsets[a]; z<in.S.offsets[a+1u]; z++) {
+            if(!wrapped(column_of(a), cell_x[in.S.indices[z]])) continue;
+            require(exterior_facet_[a]!=0u, "open x: a sampler stencil of an interior facet is across the x wrap");
+            wrap_s_++;
+        }
+    }
+    for(size_t g=0u; g<in.gradient_cells.size(); g++) { // L: the gradient stencils of interior cells (E rows are zeroed)
+        const std::uint32_t own{ in.gradient_cells[g] };
+        for(std::uint32_t z=in.gradient_offsets[3u*g]; z<in.gradient_offsets[3u*g+3u]; z++) {
+            if(!wrapped(cell_x[own], cell_x[in.gradient_indices[z]])) continue;
+            require(is_e[own]!=0u, "open x: a gradient stencil of an interior cell is across the x wrap");
+            wrap_l_++;
+        }
+    }
+    for(std::uint32_t r=0u; r<in.rows; r++) { // W: receiver row x producer row (contract O4)
+        for(std::uint32_t z=in.W.offsets[r]; z<in.W.offsets[r+1u]; z++) {
+            const std::uint32_t producer{ in.W.indices[z] };
+            require(exterior_row_[r]==0u && exterior_row_[producer]==0u, "open x: a pending (W) entry touches an exterior facet (O4)");
+            require(!wrapped(column_of(facet_of_row[r]), column_of(facet_of_row[producer])), "open x: a pending (W) entry is across the x wrap");
+        }
+        require(exterior_row_[r]==0u || in.s0[r]==0.0, "open x: an exterior row has an initial pending amount (O4)");
+    }
+}
+
+VolumetricWallNativeInput VolumetricWallOpenLayout::without_e_gradients(const VolumetricWallNativeInput& input) const {
+    VolumetricWallNativeInput out{ input };
+    for(size_t g=0u; g<out.gradient_cells.size(); g++) {
+        if(slot_of_cell_[out.gradient_cells[g]]<0) continue;
+        for(std::uint32_t z=out.gradient_offsets[3u*g]; z<out.gradient_offsets[3u*g+3u]; z++) out.gradient_weights[z] = 0.0;
+    }
+    return out;
+}
+
+std::string VolumetricWallOpenLayout::text() const {
+    std::uint64_t exterior_facets{ 0u }, exterior_rows{ 0u };
+    for(const std::uint8_t v : exterior_facet_) exterior_facets += v;
+    for(const std::uint8_t v : exterior_row_) exterior_rows += v;
+    std::ostringstream s;
+    s << "open x: Nx " << nx_ << ", E cells " << e_cells_.size() << ", exterior facets " << exterior_facets << ", exterior rows " << exterior_rows
+      << ", wrap entries (E/exterior only): D " << wrap_d_ << ", G " << wrap_g_ << ", R " << wrap_r_ << ", S " << wrap_s_ << ", L " << wrap_l_;
+    return s.str();
 }
 
 }  // namespace fluidx3d::experimental
