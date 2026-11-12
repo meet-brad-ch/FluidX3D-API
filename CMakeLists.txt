@@ -113,6 +113,7 @@ if(FLUIDX3D_EXPERIMENTAL_VOLUMETRIC_WALL)
         src/experimental/wall_builder/maps.cpp
         src/experimental/wall_builder/wall_tables.cpp
         src/experimental/wall_builder/slab_stream.cpp
+        src/experimental/wall_builder/stl_heights.cpp
         src/experimental/wall_builder/container_writer.cpp)
     target_include_directories(fluidx3d_wall_builder PUBLIC src)
     target_link_libraries(fluidx3d_wall_builder PUBLIC fluidx3d::build_options fluidx3d_openblas bcrypt)

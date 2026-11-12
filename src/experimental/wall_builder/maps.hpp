@@ -91,6 +91,9 @@ class IdentityMax {
 public:
     /// @brief max(current, |value|), NaN when either is NaN (numpy's max propagates NaN). The first current is -1.0.
     [[nodiscard]] static double largest(double current, double value);
+
+    /// @brief The maximum of two partial results of largest() (each -1.0, a magnitude, or NaN); NaN when either is NaN.
+    [[nodiscard]] static double combine(double a, double b);
 };
 
 /// @brief One wall row (facet index, direction).
@@ -175,8 +178,10 @@ class MapAssembly {
 public:
     MapAssembly(const TerrainGeometry& geometry, const VelocityTable& velocities, const PassRunner& passes, const SamplerSearch& sampler);
 
-    /// @brief assemble(vs, b, sam) without D. @throws std::runtime_error with the builder's message for a broken map
-    [[nodiscard]] AssembledMaps assemble() const;
+    /// @brief assemble(vs, b, sam) without D.
+    /// @param threads the threads that collect the entries, 1 or more
+    /// @throws std::runtime_error with the builder's message for a broken map
+    [[nodiscard]] AssembledMaps assemble(int threads) const;
 
     /// @brief The products over states of the identities.
     [[nodiscard]] static StateProducts state_products(const AssembledMaps& m);
@@ -215,8 +220,18 @@ private:
     std::vector<int> facet_by_code_{};    ///< Facet index per sorted packed key.
 
     [[nodiscard]] static std::uint64_t pack(const FacetKey& key);
-    void gather_entries(const std::vector<std::int64_t>& row_of, std::vector<Triplet>& g, std::vector<Triplet>& r) const;
-    void pending_entries(const std::vector<std::int64_t>& row_of, std::vector<Triplet>& out) const;
+    /// @brief The facets [first, last) of the sorted facet list.
+    struct FacetRange {
+        std::size_t first{};
+        std::size_t last{};
+    };
+
+    /// @brief The G, R and W entries of all facets in the serial order, collected per block of facets on all threads.
+    void entries(const std::vector<std::int64_t>& row_of, int threads, std::vector<Triplet>& g, std::vector<Triplet>& r, std::vector<Triplet>& w) const;
+    /// @brief The G and R entries of a range of facets, in facet and direction order.
+    void gather_entries(const FacetRange& range, const std::vector<std::int64_t>& row_of, std::vector<Triplet>& g, std::vector<Triplet>& r) const;
+    /// @brief The W entries of a range of facets, in facet and direction order.
+    void pending_entries(const FacetRange& range, const std::vector<std::int64_t>& row_of, std::vector<Triplet>& out) const;
     [[nodiscard]] std::vector<double> volume_times_r(const StateRows& r) const;
 };
 

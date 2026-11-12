@@ -4,10 +4,12 @@
 
 #include "maps.hpp"
 
+#include "parallel_for.hpp"
 #include "python_text.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <execution>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -88,7 +90,7 @@ StateRows SparseOps::state_rows(const std::int64_t states, const std::int64_t co
     // coo_tocsr keeps the entries of each row in input order: a stable sort by row does the same without offsets for
     // every state
     std::vector<Triplet> placed{ entries };
-    std::stable_sort(placed.begin(), placed.end(), [](const Triplet& a, const Triplet& b) { return a.row < b.row; });
+    std::stable_sort(std::execution::par, placed.begin(), placed.end(), [](const Triplet& a, const Triplet& b) { return a.row < b.row; });
     StateRows m{ states, columns, {}, { 0 }, {}, {} };
     auto first{ placed.begin() };
     while (first != placed.end()) {
@@ -144,7 +146,7 @@ StateValues SparseOps::column_sums(const SparseMatrix& m)
             entries.push_back(Triplet{ r, m.indices[static_cast<std::size_t>(e)], m.values[static_cast<std::size_t>(e)] });
         }
     }
-    std::stable_sort(entries.begin(), entries.end(), [](const Triplet& a, const Triplet& b) { return a.column < b.column; });
+    std::stable_sort(std::execution::par, entries.begin(), entries.end(), [](const Triplet& a, const Triplet& b) { return a.column < b.column; });
     StateValues y{};
     for (const Triplet& t : entries) {
         const bool new_column{ y.state.empty() || y.state.back() != t.column };
@@ -210,6 +212,14 @@ double IdentityMax::largest(const double current, const double value)
         return std::numeric_limits<double>::quiet_NaN();
     }
     return std::max(current, magnitude);
+}
+
+double IdentityMax::combine(const double a, const double b)
+{
+    if (std::isnan(a) || std::isnan(b)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    return std::max(a, b);
 }
 
 std::vector<double> SparseOps::times(const SparseMatrix& m, const std::vector<double>& x)
@@ -329,11 +339,11 @@ ProducerRowView MapAssembly::producer_unit(const int facet, const int direction)
     return passes_.row(static_cast<std::size_t>(facet), slot);
 }
 
-void MapAssembly::gather_entries(const std::vector<std::int64_t>& row_of, std::vector<Triplet>& g, std::vector<Triplet>& r) const
+void MapAssembly::gather_entries(const FacetRange& range, const std::vector<std::int64_t>& row_of, std::vector<Triplet>& g, std::vector<Triplet>& r) const
 {
     const auto q{ static_cast<std::int64_t>(velocities_.directions.size()) };
     std::vector<Accumulated> sums{};
-    for (std::size_t f{ 0 }; f < geometry_.facets().size(); ++f) {
+    for (std::size_t f{ range.first }; f < range.last; ++f) {
         for (std::int64_t d{ 0 }; d < q; ++d) {
             const ProducerRowView unit{ producer_unit(static_cast<int>(f), static_cast<int>(d)) };
             if (unit.h.empty()) {
@@ -362,11 +372,11 @@ void MapAssembly::gather_entries(const std::vector<std::int64_t>& row_of, std::v
     }
 }
 
-void MapAssembly::pending_entries(const std::vector<std::int64_t>& row_of, std::vector<Triplet>& out) const
+void MapAssembly::pending_entries(const FacetRange& range, const std::vector<std::int64_t>& row_of, std::vector<Triplet>& out) const
 {
     const auto q{ static_cast<std::int64_t>(velocities_.directions.size()) };
     std::vector<Accumulated> sums{};
-    for (std::size_t f{ 0 }; f < geometry_.facets().size(); ++f) {
+    for (std::size_t f{ range.first }; f < range.last; ++f) {
         for (std::int64_t d{ 0 }; d < q; ++d) {
             const ProducerRowView unit{ producer_unit(static_cast<int>(f), static_cast<int>(d)) };
             if (unit.w.empty()) {
@@ -390,7 +400,29 @@ void MapAssembly::pending_entries(const std::vector<std::int64_t>& row_of, std::
     }
 }
 
-AssembledMaps MapAssembly::assemble() const
+void MapAssembly::entries(const std::vector<std::int64_t>& row_of, const int threads, std::vector<Triplet>& g, std::vector<Triplet>& r,
+                          std::vector<Triplet>& w) const
+{
+    // blocks of facets on all threads; the blocks are joined in facet order, so the entries keep the serial order
+    const std::size_t facets{ geometry_.facets().size() };
+    const std::size_t block{ 4096 };
+    const std::size_t blocks{ (facets + block - 1) / block };
+    std::vector<std::vector<Triplet>> g_parts(blocks);
+    std::vector<std::vector<Triplet>> r_parts(blocks);
+    std::vector<std::vector<Triplet>> w_parts(blocks);
+    ParallelFor::run(blocks, threads, [&](const std::size_t b) {
+        const FacetRange range{ b * block, std::min(facets, (b + 1) * block) };
+        gather_entries(range, row_of, g_parts[b], r_parts[b]);
+        pending_entries(range, row_of, w_parts[b]);
+    });
+    for (std::size_t b{ 0 }; b < blocks; ++b) {
+        g.insert(g.end(), g_parts[b].begin(), g_parts[b].end());
+        r.insert(r.end(), r_parts[b].begin(), r_parts[b].end());
+        w.insert(w.end(), w_parts[b].begin(), w_parts[b].end());
+    }
+}
+
+AssembledMaps MapAssembly::assemble(const int threads) const
 {
     const auto q{ static_cast<std::int64_t>(velocities_.directions.size()) };
     const auto cells{ static_cast<std::int64_t>(geometry_.cell_count()) };
@@ -413,8 +445,7 @@ AssembledMaps MapAssembly::assemble() const
     std::vector<Triplet> r_entries{};
     std::vector<Triplet> w_entries{};
     std::vector<Triplet> s_entries{};
-    gather_entries(row_of, g_entries, r_entries);
-    pending_entries(row_of, w_entries);
+    entries(row_of, threads, g_entries, r_entries, w_entries);
     for (std::int64_t f{ 0 }; f < facets; ++f) {
         const FacetSample& sample{ sampler_.samples()[static_cast<std::size_t>(f)] };
         for (std::size_t n{ 0 }; n < sample.cells.size(); ++n) {

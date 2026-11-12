@@ -8,6 +8,12 @@
 /// Usage: volumetric_wall_builder --heights CSV --z-top Z --nu NU --friction K --out FILE
 ///            [--velocities D3Q27|D3Q19] [--name NAME] [--rough-z0 Z0] [--rough-K0 K0] [--allow-steep]
 ///            [--initial-velocity ux,uy,uz] [--threads N] [--memory-gb GB] [--temp-dir DIR] [--slab-columns N]
+///        volumetric_wall_builder --stl STL --cell-m M [--apron N] [--cache-dir DIR] [--heights-only] (other options as above)
+/// --stl samples the terrain STL into node heights (stl_heights.hpp) in place of --heights; the CSV is cached in DIR
+/// (default %LOCALAPPDATA%\FluidX3D\terrain_heights) under a key of the STL bytes and the recipe, so the next build with
+/// the same STL and recipe reads it. --heights-only writes (or finds) the cached CSV, prints its path and stops.
+/// --skip-identity-gate writes the container also when the native identity gate fails (a test of the build and write path:
+/// the report still goes to FILE.rejected.json, the build report says "failed", and the engine's check refuses such a file).
 /// Exit codes as terrain_container.py: 0 written, 2 refused input, 3 map identities violated (FILE.rejected.json), 1 error.
 
 #include "container_writer.hpp"
@@ -17,6 +23,7 @@
 #include "python_text.hpp"
 #include "sampler.hpp"
 #include "sha256.hpp"
+#include "stl_heights.hpp"
 #include "terrain.hpp"
 #include "terrain_input.hpp"
 #include "wall_tables.hpp"
@@ -67,6 +74,12 @@ struct Arguments {
     double memory_gb{ 64.0 };   ///< --memory-gb: the memory budget in GiB.
     std::string temp_dir{};     ///< --temp-dir: the parent of the temporary folder (empty: the folder of --out).
     int slab_columns{};         ///< --slab-columns: a fixed slab width in x-columns (0: from the budget).
+    std::string stl{};          ///< --stl: a terrain STL in place of --heights.
+    double cell_m{};            ///< --cell-m: the cell size of --stl in metres.
+    int apron{ 8 };             ///< --apron: flat columns added at each x end of --stl.
+    std::string cache_dir{};    ///< --cache-dir: the heights cache of --stl (empty: %LOCALAPPDATA%\FluidX3D\terrain_heights).
+    bool heights_only{};        ///< --heights-only: write the cached heights CSV and stop.
+    bool skip_identity_gate{};  ///< --skip-identity-gate: write the container also when the identity gate fails.
 };
 
 /// @brief Parses the command line.
@@ -79,6 +92,12 @@ public:
         std::map<std::string, std::string> values{ flags(argc, argv) };
         Arguments a{};
         a.allow_steep = values.count("--allow-steep") > 0;
+        a.heights_only = values.count("--heights-only") > 0;
+        a.skip_identity_gate = values.count("--skip-identity-gate") > 0;
+        terrain(values, a);
+        if (a.heights_only) {
+            return a;
+        }
         required(values, a);
         optional(values, a);
         physics(values, a);
@@ -93,7 +112,7 @@ private:
         std::map<std::string, std::string> values{};
         for (int n{ 1 }; n < argc; ++n) {
             const std::string flag{ argv[n] };
-            if (flag == "--allow-steep") {
+            if (flag == "--allow-steep" || flag == "--heights-only" || flag == "--skip-identity-gate") {
                 values[flag] = "1";
                 continue;
             }
@@ -105,15 +124,47 @@ private:
         return values;
     }
 
+    /// @brief The terrain: --heights, or --stl with --cell-m (and --apron, --cache-dir).
+    /// @throws std::invalid_argument when neither or both are given, or a value is not a number
+    static void terrain(std::map<std::string, std::string>& values, Arguments& a)
+    {
+        const bool has_heights{ values.count("--heights") > 0 };
+        const bool has_stl{ values.count("--stl") > 0 };
+        if (has_heights == has_stl) {
+            throw std::invalid_argument("give one of --heights CSV and --stl STL");
+        }
+        if (has_heights) {
+            if (a.heights_only) {
+                throw std::invalid_argument("--heights-only needs --stl");
+            }
+            a.heights = values["--heights"];
+            return;
+        }
+        if (values.count("--cell-m") == 0) {
+            throw std::invalid_argument("--stl needs --cell-m");
+        }
+        a.stl = values["--stl"];
+        a.cell_m = number(values["--cell-m"]);
+        if (values.count("--apron") > 0) {
+            a.apron = std::stoi(values["--apron"]);
+        }
+        if (values.count("--cache-dir") > 0) {
+            a.cache_dir = values["--cache-dir"];
+        }
+        a.threads = static_cast<int>(std::thread::hardware_concurrency());
+        if (values.count("--threads") > 0) {
+            a.threads = std::stoi(values["--threads"]);
+        }
+    }
+
     /// @brief The required options. @throws std::invalid_argument when one is missing or not a number
     static void required(std::map<std::string, std::string>& values, Arguments& a)
     {
-        for (const char* name : { "--heights", "--z-top", "--nu", "--friction", "--out" }) {
+        for (const char* name : { "--z-top", "--nu", "--friction", "--out" }) {
             if (values.count(name) == 0) {
                 throw std::invalid_argument(std::string{ "missing " } + name);
             }
         }
-        a.heights = values["--heights"];
         a.z_top = std::stoi(values["--z-top"]);
         a.nu = number(values["--nu"]);
         a.friction = number(values["--friction"]);
@@ -243,7 +294,8 @@ public:
         last_ = now;
         stages.push_back(Stage{ name, seconds });
         const double private_gb{ static_cast<double>(ProcessMemory::private_bytes()) / 1e9 };
-        std::cout << "  " << name << " " << seconds << " s, private " << private_gb << " GB" << std::endl;
+        const double elapsed{ std::chrono::duration<double>(now - start_).count() };
+        std::cout << "  " << name << " " << seconds << " s, private " << private_gb << " GB (at " << elapsed << " s)" << std::endl;
     }
 
     /// @brief Seconds since the start.
@@ -327,6 +379,7 @@ public:
         const TerrainGeometry* geometry{};
         IdentityValues identities{};
         IdentityValues native{};              ///< The gate's worst relative residuals.
+        std::string identity_gate{};          ///< "passed", or "failed (...)" with --skip-identity-gate.
         std::int64_t added_253{};             ///< Wall-list cells added by rule #253.
         const StageClock* clock{};
     };
@@ -354,6 +407,8 @@ public:
         identities_json(json, f.identities);
         json.key("native_identities");
         identities_json(json, f.native);
+        json.key("identity_gate");
+        json.value(f.identity_gate);
         json.key("seconds");
         json.begin_object();
         for (const StageClock::Stage& stage : f.clock->stages) {
@@ -488,28 +543,30 @@ private:
 /// @brief The disk space the build needs: the container and the temporary files of D and direct_arm.
 class DiskCheck {
 public:
-    /// @brief Fails when a disk has less than twice the estimate free.
+    /// @brief Fails when a disk has less free space than the estimate plus a quarter.
     /// @param cells the fluid cells
     /// @param q the velocity set size
     /// @throws Refused naming the disk, the free space and the need
     static void require(const std::filesystem::path& out_folder, const std::filesystem::path& temp_folder, const std::size_t cells, const std::size_t q)
     {
-        // per cell at most: cell_xyz, volume, centroid, mode_phi; per state: D (offsets, indices, weights), R_offsets, f0,
-        // direct_arm; the temporary files hold D and direct_arm once more
-        const double container{ static_cast<double>(cells) * (52.0 + 52.0 * static_cast<double>(q)) };
+        // per cell: cell_xyz, volume, centroid, mode_phi; per state at most: D (offsets, indices, weights), R_offsets, f0,
+        // direct_arm; the surface sections add about a fifth (hill: 1814 B/cell measured against 1456 B/cell here). The
+        // temporary files hold D and direct_arm once more until the container is written.
+        const double container{ static_cast<double>(cells) * (52.0 + 52.0 * static_cast<double>(q)) * 1.25 };
         const double temporary{ static_cast<double>(cells) * (40.0 * static_cast<double>(q)) };
+        const double margin{ 1.25 };
         const std::filesystem::space_info out_space{ std::filesystem::space(out_folder) };
         const std::filesystem::space_info temp_space{ std::filesystem::space(temp_folder) };
         const bool same_disk{ std::filesystem::absolute(out_folder).root_name() == std::filesystem::absolute(temp_folder).root_name() };
-        const double out_need{ same_disk ? 2.0 * (container + temporary) : 2.0 * container };
-        const double temp_need{ 2.0 * temporary };
+        const double out_need{ same_disk ? margin * (container + temporary) : margin * container };
+        const double temp_need{ margin * temporary };
         if (static_cast<double>(out_space.available) < out_need) {
             throw Refused("the disk of " + out_folder.string() + " has " + gigabytes(static_cast<double>(out_space.available)) + " free; the build needs "
-                          + gigabytes(out_need) + " (twice the estimate)");
+                          + gigabytes(out_need) + " (the estimate plus a quarter)");
         }
         if (static_cast<double>(temp_space.available) < temp_need) {
             throw Refused("the disk of " + temp_folder.string() + " has " + gigabytes(static_cast<double>(temp_space.available)) + " free; the temporary files need "
-                          + gigabytes(temp_need) + " (twice the estimate)");
+                          + gigabytes(temp_need) + " (the estimate plus a quarter)");
         }
     }
 
@@ -566,6 +623,27 @@ public:
         } catch (const std::invalid_argument& error) {
             throw Refused(error.what());
         }
+    }
+
+    /// @brief The heights CSV: --heights, or the cached CSV of --stl (sampled when it is not in the cache).
+    /// @throws std::runtime_error when the STL cannot be sampled or the cache cannot be written
+    [[nodiscard]] static std::string heights_csv(const Arguments& a)
+    {
+        if (a.stl.empty()) {
+            return a.heights;
+        }
+        std::filesystem::path cache{ a.cache_dir };
+        if (cache.empty()) {
+            const char* const local{ std::getenv("LOCALAPPDATA") }; // NOLINT(concurrency-mt-unsafe): read once at start-up
+            if (local == nullptr) {
+                throw std::runtime_error("LOCALAPPDATA is not set: give --cache-dir");
+            }
+            cache = std::filesystem::path{ local } / "FluidX3D" / "terrain_heights";
+        }
+        HeightsRecipe recipe{};
+        recipe.cell_m = a.cell_m;
+        recipe.apron = a.apron;
+        return StlHeights::cached(a.stl, recipe, cache, a.threads).string();
     }
 
     /// @brief The cells of one slab within the memory budget (the largest x-column sets the least).
@@ -657,6 +735,10 @@ public:
         facts.geometry = parts.geometry;
         facts.identities = parts.identities;
         facts.native = gate.worst;
+        facts.identity_gate = "passed";
+        if (!gate.passed) {
+            facts.identity_gate = "failed (written with --skip-identity-gate; see the .rejected.json)";
+        }
         facts.added_253 = static_cast<std::int64_t>(parts.wall->added_253.size());
         facts.clock = &clock;
         write_text(a.out + ".build.json", Reports::build(facts));
@@ -671,10 +753,18 @@ public:
 /// @brief The whole build. @return the exit code
 int build(const Arguments& a)
 {
-    BuildSteps::refuse_bad_options(a);
     StageClock clock{};
+    const std::string heights{ BuildSteps::heights_csv(a) };
+    if (a.heights_only) {
+        std::cout << heights << std::endl;
+        return 0;
+    }
+    BuildSteps::refuse_bad_options(a);
+    if (!a.stl.empty()) {
+        clock.lap("heights");
+    }
     const VelocityTable velocities{ VelocityTable::named(a.velocities) };
-    const TerrainInput input{ TerrainInput::from_csv(a.heights, a.z_top, a.name) };
+    const TerrainInput input{ TerrainInput::from_csv(heights, a.z_top, a.name) };
     input.domain_checks(a.allow_steep);
     const TerrainGeometry geometry{ input.record(velocities, 12), a.threads };
     const std::size_t cells{ geometry.cell_count() };
@@ -688,16 +778,19 @@ int build(const Arguments& a)
     sampler.check();
     clock.lap("sampler");
     const MapAssembly assembly{ geometry, velocities, passes, sampler };
-    const AssembledMaps maps{ assembly.assemble() };
+    const AssembledMaps maps{ assembly.assemble(a.threads) };
+    clock.lap("maps_assemble");
     const StateProducts state_products{ MapAssembly::state_products(maps) };
     const RowProducts row_products{ assembly.row_products(maps) };
     const RowGate row_gate{ MapAssembly::row_gate(maps, row_products) };
+    clock.lap("maps_products");
     const PermutedMaps permuted{ assembly.permute(maps) };
+    clock.lap("maps_permute");
     const WallTables tables{ geometry, velocities, assembly };
     const ArmTables arms{ tables.arms(maps, permuted) };
     const std::vector<char> wall_flags{ BuildSteps::wall_flags(arms, cells) };
     const std::vector<std::int64_t> support{ BuildSteps::support_cells(permuted.s) };
-    clock.lap("surface_maps");
+    clock.lap("maps_arms");
     const std::filesystem::path out_path{ std::filesystem::absolute(a.out) };
     const std::filesystem::path temp_parent{ BuildSteps::temp_parent(a, out_path, cells, velocities.directions.size()) };
     const TempFolder temp{ temp_parent / (out_path.filename().string() + ".sections") };
@@ -718,9 +811,13 @@ int build(const Arguments& a)
     const GateReport gate{ BuildSteps::gate(streamed, row_gate) };
     if (!gate.passed) {
         write_text(a.out + ".rejected.json", Reports::rejection(gate, maps, geometry, velocities, a));
-        std::cout << "REFUSED: map identities violated (native definitions, tolerance 1e-10); no container written" << std::endl;
-        std::cout << "diagnostic report: " << a.out << ".rejected.json" << std::endl;
-        return 3;
+        if (!a.skip_identity_gate) {
+            std::cout << "REFUSED: map identities violated (native definitions, tolerance 1e-10); no container written" << std::endl;
+            std::cout << "diagnostic report: " << a.out << ".rejected.json" << std::endl;
+            return 3;
+        }
+        std::cout << "WARNING: map identities violated (native definitions, tolerance 1e-10); --skip-identity-gate writes the container anyway"
+                  << " (diagnostic report: " << a.out << ".rejected.json)" << std::endl;
     }
     const ContainerParts parts{ .input = &input, .velocities = &velocities, .geometry = &geometry, .sampler = &sampler, .permuted = &permuted,
                                 .identities = identities, .diag = diag, .stream = &stream, .arms = &arms, .wall = &wall, .gradient = &gradient };

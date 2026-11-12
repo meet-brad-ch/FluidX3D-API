@@ -159,23 +159,35 @@ void DonorColumns::compute(const std::vector<int>& columns)
 {
     const std::size_t q{ geometry_.record().directions.size() };
     // the cells of the new columns in one list, so the threads share the work of all of them
-    std::vector<std::size_t> cells{};
-    std::vector<DonorColumn*> owner{};
+    std::vector<int> fresh{};
     for (const int i : columns) {
-        std::unique_ptr<DonorColumn>& slot{ columns_[static_cast<std::size_t>(i)] };
-        if (slot) {
-            continue;
+        if (!columns_[static_cast<std::size_t>(i)]) {
+            fresh.push_back(i);
         }
+    }
+    // the list can name a column twice (the periodic neighbours of a slab as wide as the box): each is made once
+    std::sort(fresh.begin(), fresh.end());
+    fresh.erase(std::unique(fresh.begin(), fresh.end()), fresh.end());
+    // the arrays of the new columns are allocated and filled on the worker threads (one column each), not on this one
+    ParallelFor::run(fresh.size(), threads_, [&](const std::size_t n) {
+        const int i{ fresh[n] };
         const std::size_t first{ geometry_.column_first(i) };
         const std::size_t last{ geometry_.column_first(i + 1) };
-        slot = std::make_unique<DonorColumn>();
-        slot->first = first;
-        slot->states.assign((last - first) * q, DonorState{});
-        slot->events.assign(last - first, {});
-        slot->event_end.assign((last - first) * q, 0u);
-        for (std::size_t n{ first }; n < last; ++n) {
+        auto column{ std::make_unique<DonorColumn>() };
+        column->first = first;
+        column->states.assign((last - first) * q, DonorState{});
+        column->events.assign(last - first, {});
+        column->event_end.assign((last - first) * q, 0u);
+        columns_[static_cast<std::size_t>(i)] = std::move(column);
+    });
+    std::vector<std::size_t> cells{};
+    std::vector<DonorColumn*> owner{};
+    for (const int i : fresh) {
+        DonorColumn* const column{ columns_[static_cast<std::size_t>(i)].get() };
+        const std::size_t last{ geometry_.column_first(i + 1) };
+        for (std::size_t n{ column->first }; n < last; ++n) {
             cells.push_back(n);
-            owner.push_back(slot.get());
+            owner.push_back(column);
         }
     }
     ParallelFor::run(cells.size(), threads_, [&](const std::size_t task) {
