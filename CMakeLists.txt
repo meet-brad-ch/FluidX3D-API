@@ -78,4 +78,47 @@ if(FLUIDX3D_EXPERIMENTAL_VOLUMETRIC_WALL)
     add_executable(volumetric_wall_native_check tests/physics/volumetric_wall_native_check.cpp)
     target_link_libraries(volumetric_wall_native_check PRIVATE fluidx3d_volumetric_wall_native)
     set_target_properties(volumetric_wall_native_check PROPERTIES FLUIDX3D_PRECISE_FLOAT ON RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/bin")
+    # The compiled terrain container builder (scripts/slip_wall/terrain_container.py, builder3d.py). Its results must be
+    # bit-identical to the Python builder, so no fast math, and the small dense algebra that Python takes from numpy (the
+    # sampler and gradient least squares) uses the same OpenBLAS: scipy-openblas64 0.3.29 equals numpy 2.2.6's bundled
+    # library bit for bit on gemm, gesv and gemv (20000 of 20000 stencils, 2026-11-12); plain loops do not (5 of 20000).
+    if(NOT WIN32)
+        message(FATAL_ERROR "FLUIDX3D_EXPERIMENTAL_VOLUMETRIC_WALL: the terrain container builder pins the win_amd64 OpenBLAS wheel; it is Windows only")
+    endif()
+    FetchContent_Declare(scipy_openblas64
+        URL https://files.pythonhosted.org/packages/2c/e0/c867ebc370df7ccbce3beb2da46427609000ce5d6989b654283069d55627/scipy_openblas64-0.3.29.265.1-py3-none-win_amd64.whl
+        URL_HASH SHA256=bdaddfa0cc7fab816f380503085117064641ccc722464c4b900309c77cbe2e96
+        DOWNLOAD_NAME scipy_openblas64-0.3.29.265.1.zip  # a wheel is a zip; the name lets CMake extract it
+    )
+    FetchContent_MakeAvailable(scipy_openblas64)
+    add_library(fluidx3d_openblas SHARED IMPORTED GLOBAL) # GLOBAL: tests/ links it too
+    set_target_properties(fluidx3d_openblas PROPERTIES
+        IMPORTED_LOCATION "${scipy_openblas64_SOURCE_DIR}/scipy_openblas64/lib/libscipy_openblas64_.dll"
+        IMPORTED_IMPLIB "${scipy_openblas64_SOURCE_DIR}/scipy_openblas64/lib/libscipy_openblas64_.lib"
+        INTERFACE_INCLUDE_DIRECTORIES "${scipy_openblas64_SOURCE_DIR}/scipy_openblas64/include")
+    add_library(fluidx3d_wall_builder STATIC
+        src/experimental/wall_builder/wide_int.cpp
+        src/experimental/wall_builder/correct_rounding.cpp
+        src/experimental/wall_builder/dyadic.cpp
+        src/experimental/wall_builder/poly.cpp
+        src/experimental/wall_builder/terrain.cpp
+        src/experimental/wall_builder/passes.cpp
+        src/experimental/wall_builder/pass_runner.cpp
+        src/experimental/wall_builder/sampler.cpp
+        src/experimental/wall_builder/dense_algebra.cpp
+        src/experimental/wall_builder/stencil.cpp
+        src/experimental/wall_builder/python_text.cpp
+        src/experimental/wall_builder/sha256.cpp
+        src/experimental/wall_builder/terrain_input.cpp
+        src/experimental/wall_builder/maps.cpp
+        src/experimental/wall_builder/wall_tables.cpp
+        src/experimental/wall_builder/container_writer.cpp)
+    target_include_directories(fluidx3d_wall_builder PUBLIC src)
+    target_link_libraries(fluidx3d_wall_builder PUBLIC fluidx3d::build_options fluidx3d_openblas bcrypt)
+    set_target_properties(fluidx3d_wall_builder PROPERTIES FLUIDX3D_PRECISE_FLOAT ON)
+    add_executable(volumetric_wall_builder src/experimental/wall_builder/main.cpp)
+    target_link_libraries(volumetric_wall_builder PRIVATE fluidx3d_wall_builder)
+    set_target_properties(volumetric_wall_builder PROPERTIES FLUIDX3D_PRECISE_FLOAT ON RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/bin")
+    add_custom_command(TARGET volumetric_wall_builder POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:fluidx3d_openblas> $<TARGET_FILE_DIR:volumetric_wall_builder>)
 endif()

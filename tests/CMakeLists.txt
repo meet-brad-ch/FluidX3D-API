@@ -93,4 +93,10 @@ if(FLUIDX3D_EXPERIMENTAL_VOLUMETRIC_WALL)
     target_compile_definitions(fluidx3d_volumetric_wall_native_tests PRIVATE FLUIDX3D_VWNAT27_FIXTURE="${PROJECT_SOURCE_DIR}/tests/data/slip_wall/M3_d3q27.vwnat") # the D3Q27 M3 terrain (tests/data/slip_wall/PROVENANCE.json)
     target_compile_definitions(fluidx3d_volumetric_wall_native_tests PRIVATE FLUIDX3D_VWNAT_FIXTURE="${PROJECT_SOURCE_DIR}/tests/data/slip_wall/N16_decay_finite.vwnat") # the registered N16 container of the research tree
     target_compile_definitions(fluidx3d_volumetric_wall_native_tests PRIVATE FLUIDX3D_VWNAT_P2_FIXTURE="${PROJECT_SOURCE_DIR}/tests/data/slip_wall/N16_decay_finite_p2.vwnat") # task 43: the same container with the friction_rows section (vwnat_rows.py --build-p2)
+    # The exact arithmetic of the wall builder against Python's own results (scripts/slip_wall/make_wall_builder_vectors.py)
+    fluidx3d_add_test(fluidx3d_wall_builder_tests SOURCES unit/wall_builder_test.cpp LINK fluidx3d_wall_builder)
+    set_target_properties(fluidx3d_wall_builder_tests PROPERTIES FLUIDX3D_PRECISE_FLOAT ON)
+    target_compile_definitions(fluidx3d_wall_builder_tests PRIVATE FLUIDX3D_WALL_BUILDER_VECTORS="${PROJECT_SOURCE_DIR}/tests/data/slip_wall/wall_builder_vectors.txt")
+    add_custom_command(TARGET fluidx3d_wall_builder_tests PRE_LINK # before the POST_BUILD test discovery runs the exe
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:fluidx3d_openblas> $<TARGET_FILE_DIR:fluidx3d_wall_builder_tests>)
 endif()

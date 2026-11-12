@@ -1009,6 +1009,27 @@ class NativeIdentityGate:
         return out
 
 
+def compiled_build(args) -> int:
+    """@brief Runs the compiled builder with the same options (numbers as repr(), which round-trips exactly). @return its exit code"""
+    import subprocess  # noqa: PLC0415
+    if not args.compiled_builder.is_file():
+        print(f"REFUSED: --compiled-builder {args.compiled_builder}: no such file")
+        return 2
+    command = [str(args.compiled_builder), "--heights", str(args.heights), "--z-top", str(args.z_top), "--nu", repr(args.nu),
+               "--friction", repr(args.friction), "--velocities", args.velocities, "--name", args.name, "--out", str(args.out)]
+    if args.rough_z0 is not None:
+        command += ["--rough-z0", repr(args.rough_z0)]
+    if args.rough_K0 != 0.0:
+        command += ["--rough-K0", repr(args.rough_K0)]
+    if args.allow_steep:
+        command.append("--allow-steep")
+    if args.initial_velocity is not None:
+        command += ["--initial-velocity", args.initial_velocity]
+    if args.threads > 0:
+        command += ["--threads", str(args.threads)]
+    return subprocess.call(command)
+
+
 def main(argv: list) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--heights", required=True, type=Path, help="CSV: Ny lines of Nx node heights")
@@ -1026,9 +1047,15 @@ def main(argv: list) -> int:
                         "cover their own bounded inputs, not every steep terrain; the map identity gate still applies")
     parser.add_argument("--workers", type=int, default=1, help="processes for the producer and donor passes (the container is "
                         "the same, byte for byte, as with 1)")
+    parser.add_argument("--compiled-builder", type=Path, default=None, help="build the container with the compiled tool "
+                        "bin/volumetric_wall_builder(.exe) on all cores (src/experimental/wall_builder): every numeric section is the same, "
+                        "byte for byte, as this Python builder's; its provenance names the tool instead of the Python exporter")
+    parser.add_argument("--threads", type=int, default=0, help="threads of --compiled-builder (default 0: every hardware thread)")
     parser.add_argument("--initial-velocity", default=None, help="V2: ux,uy,uz: f0 = feq3(1, u) in every cell (the uniform start of an "
                         "open-x run, e.g. 0.05,0,0); default: the rest start f0 = w. s0 stays the rest prehistory")
     args = parser.parse_args(argv)
+    if args.compiled_builder is not None:
+        return compiled_build(args)
     if args.out.exists():
         print(f"REFUSED: {args.out} exists")
         return 2
